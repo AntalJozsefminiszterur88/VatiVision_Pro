@@ -648,7 +648,20 @@ class Main(QtWidgets.QMainWindow):
         self.ui_logger = logging.getLogger(f"{__name__}.UI")
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central); root.setContentsMargins(12,12,12,12); root.setSpacing(12)
+
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
+
+        title_label = QtWidgets.QLabel("VatiVision Pro")
+        title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+        main_layout.addWidget(title_label, 0, QtCore.Qt.AlignLeft)
+
+        root = QtWidgets.QHBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+        main_layout.addLayout(root, 1)
 
         side = QtWidgets.QFrame(); side.setFixedWidth(340)
         side.setStyleSheet(f"QFrame {{ background-color:{DARK_CARD}; border-radius:12px; }}")
