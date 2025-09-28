@@ -506,7 +506,7 @@ class Core(QtCore.QObject):
         await self._create_and_send_offer()
         self._emit_log("[media] Képernyőmegosztás elindítva.")
 
-    async def stop_share(self):
+    async def stop_share(self, *, renegotiate: bool = True):
         if not self.pc: return
         if self._video_sender:
             try: self.pc.removeTrack(self._video_sender)
@@ -516,10 +516,11 @@ class Core(QtCore.QObject):
             try: await self._share_track.stop()
             except Exception: pass
             self._share_track = None
-        try:
-            await self._create_and_send_offer()
-        except Exception as e:
-            self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
+        if renegotiate:
+            try:
+                await self._create_and_send_offer()
+            except Exception as e:
+                self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
         self._emit_log("[media] Képernyőmegosztás leállítva.")
 
     async def set_resolution(self, width: int, height: int):
@@ -564,6 +565,10 @@ class Core(QtCore.QObject):
                 self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
 
     async def stop(self):
+        try:
+            await self.stop_share(renegotiate=False)
+        except Exception:
+            pass
         try:
             if self.ws: await self.ws.close()
         except: pass
@@ -650,6 +655,17 @@ class Main(QtWidgets.QMainWindow):
         self.btn_share_start = AnimatedButton("Megosztás indítása")
         self.btn_share_stop  = AnimatedButton("Megosztás leállítása")
 
+        self._pending_fps: Optional[int] = None
+        self._pending_bitrate: Optional[int] = None
+
+        self._fps_debounce = QtCore.QTimer(self)
+        self._fps_debounce.setSingleShot(True)
+        self._fps_debounce.timeout.connect(self._apply_pending_fps)
+
+        self._br_debounce = QtCore.QTimer(self)
+        self._br_debounce.setSingleShot(True)
+        self._br_debounce.timeout.connect(self._apply_pending_bitrate)
+
         sh.addWidget(QtWidgets.QLabel("Felbontás:"), 0, 0)
         sh.addWidget(self.res_combo, 0, 1, 1, 2)
         sh.addWidget(self.fps_label, 1, 0)
@@ -706,6 +722,24 @@ class Main(QtWidgets.QMainWindow):
     def log_ui_message(self, message: str, level: int = logging.INFO) -> None:
         self.ui_logger.log(level, message)
         self.log.appendPlainText(message)
+
+    def _apply_pending_fps(self) -> None:
+        value = self._pending_fps
+        self._pending_fps = None
+        if value is None:
+            return
+        if self.core:
+            self.log_ui_message(f"FPS módosítása: {value}")
+            asyncio.create_task(self.core.set_fps(value))
+
+    def _apply_pending_bitrate(self) -> None:
+        value = self._pending_bitrate
+        self._pending_bitrate = None
+        if value is None:
+            return
+        if self.core:
+            self.log_ui_message(f"Bitráta módosítása: {value} kbps")
+            asyncio.create_task(self.core.set_bitrate(value))
 
     @QtCore.Slot()
     def on_start(self):
@@ -782,17 +816,15 @@ class Main(QtWidgets.QMainWindow):
     def on_fps_changed(self, val: int):
         self.fps_label.setText(f"FPS: {val}")
         self._save_setting("ui/fps", val)
-        if self.core:
-            self.log_ui_message(f"FPS módosítása: {val}")
-            asyncio.create_task(self.core.set_fps(val))
+        self._pending_fps = val
+        self._fps_debounce.start(200)
 
     @QtCore.Slot()
     def on_br_changed(self, val: int):
         self.br_label.setText(f"Bitráta: {val} kbps")
         self._save_setting("ui/bitrate", val)
-        if self.core:
-            self.log_ui_message(f"Bitráta módosítása: {val} kbps")
-            asyncio.create_task(self.core.set_bitrate(val))
+        self._pending_bitrate = val
+        self._br_debounce.start(200)
 
     @QtCore.Slot(QtGui.QImage)
     def update_video(self, img: QtGui.QImage):
