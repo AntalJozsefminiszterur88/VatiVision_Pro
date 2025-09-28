@@ -117,7 +117,7 @@ TURN_HOST    = "vatib-vezerlo.duckdns.org"
 ROOM_NAME    = "VATI-ROOM"
 ROOM_PIN     = "428913"
 STUN_URLS    = ["stun:stun.l.google.com:19302"]
-APP_TITLE    = "VatiVision Pro — Kliens (Ping + TURN + Sávszél + Képernyő)"
+APP_TITLE    = "VatiVision Pro - UMKGL Solutions"
 APP_ICON_PATH = Path(__file__).resolve().parent / "program_logo.png"
 
 BW_SECONDS   = 5.0
