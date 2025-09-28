@@ -633,9 +633,12 @@ class Main(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1200, 720)
+
         if APP_ICON_PATH.exists():
-            icon = QtGui.QIcon(str(APP_ICON_PATH))
-            self.setWindowIcon(icon)
+            self._app_icon = QtGui.QIcon(str(APP_ICON_PATH))
+        else:
+            self._app_icon = self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+        self.setWindowIcon(self._app_icon)
 
         self.ui_logger = logging.getLogger(f"{__name__}.UI")
 
@@ -770,6 +773,14 @@ class Main(QtWidgets.QMainWindow):
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
 
+        self._tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
+        self._tray_message_shown = False
+        self._allow_close = False
+        if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            self._create_tray_icon()
+        else:
+            self.log_ui_message("A rendszer nem támogatja a tálca ikont, kilépéskor az alkalmazás bezárul.", logging.INFO)
+
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
         self.log.appendPlainText(message)
@@ -889,12 +900,76 @@ class Main(QtWidgets.QMainWindow):
             self.video_label.setPixmap(scaled)
         return super().resizeEvent(e)
 
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        if event.type() == QtCore.QEvent.WindowStateChange and self._tray_icon and self._tray_icon.isVisible():
+            if self.isMinimized():
+                QtCore.QTimer.singleShot(0, self.hide)
+                if not self._tray_message_shown:
+                    self._tray_icon.showMessage(
+                        "VatiVision Pro",
+                        "Az alkalmazás tovább fut a tálcán.",
+                        QtWidgets.QSystemTrayIcon.Information,
+                        3000,
+                    )
+                    self._tray_message_shown = True
+        super().changeEvent(event)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.fullscreen_window and self.fullscreen_window.isVisible():
             self.fullscreen_window.close()
         self._save_setting("window/geometry", self.saveGeometry())
         self.settings.sync()
+        if self._tray_icon and self._tray_icon.isVisible() and not self._allow_close:
+            event.ignore()
+            self.hide()
+            if not self._tray_message_shown:
+                self._tray_icon.showMessage(
+                    "VatiVision Pro",
+                    "Az alkalmazás tovább fut a tálcán.",
+                    QtWidgets.QSystemTrayIcon.Information,
+                    3000,
+                )
+                self._tray_message_shown = True
+            return
         super().closeEvent(event)
+
+    def _create_tray_icon(self) -> None:
+        self._tray_icon = QtWidgets.QSystemTrayIcon(self._app_icon, self)
+        self._tray_icon.setToolTip(APP_TITLE)
+
+        menu = QtWidgets.QMenu()
+        show_action = menu.addAction("Megnyitás")
+        show_action.triggered.connect(self._restore_from_tray)
+        menu.addSeparator()
+        quit_action = menu.addAction("Kilépés")
+        quit_action.triggered.connect(self._quit_app)
+
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _restore_from_tray(self) -> None:
+        if not self._tray_icon:
+            return
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+        self._tray_message_shown = True
+
+    def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QtWidgets.QSystemTrayIcon.Trigger,
+            QtWidgets.QSystemTrayIcon.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _quit_app(self) -> None:
+        self._allow_close = True
+        if self._tray_icon:
+            self._tray_icon.hide()
+        if self.core:
+            self.on_stop()
+        self.close()
 
     @QtCore.Slot()
     def on_toggle_fullscreen(self) -> None:
