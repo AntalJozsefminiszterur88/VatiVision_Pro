@@ -524,6 +524,3 @@ def main():
     w = Main(); w.show()
     with loop:
         loop.run_forever()
-
-if __name__ == "__main__":
-    main()
