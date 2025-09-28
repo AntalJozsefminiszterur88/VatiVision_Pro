@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass
@@ -47,6 +48,10 @@ class ScreenShareTrack(VideoStreamTrack):
         self._region = region
         self._sct = None
         self._last_ts = 0.0
+        self._monitors_cache = []
+        self._capture_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vati-screenshare"
+        )
         self._init_capture()
 
     def set_size(self, width: int, height: int):
@@ -63,17 +68,19 @@ class ScreenShareTrack(VideoStreamTrack):
         self._region = region
 
     def _init_capture(self):
+        self._monitors_cache = []
         try:
-            self._sct = mss()
+            with mss() as temp_sct:
+                self._monitors_cache = list(temp_sct.monitors)
         except Exception as exc:
             logger.exception("Nem sikerült inicializálni az MSS rögzítőt: %s", exc)
-            self._sct = None
+            self._monitors_cache = []
         self._monitor_index = self._sanitize_monitor_index(self._requested_monitor)
 
-    def _sanitize_monitor_index(self, monitor_index: int) -> int:
-        if not self._sct:
-            return 0
-        monitors = getattr(self._sct, "monitors", []) or []
+    def _sanitize_monitor_index(self, monitor_index: int, monitors=None) -> int:
+        if monitors is None:
+            monitors = self._monitors_cache
+        monitors = monitors or []
         if not monitors:
             logger.warning("Nem található egyetlen monitor sem a képernyőmegosztáshoz.")
             return 0
@@ -92,15 +99,18 @@ class ScreenShareTrack(VideoStreamTrack):
         return idx
 
     def _grab_frame(self) -> VideoFrame:
-        if not self._sct:
-            raise RuntimeError("A képernyő rögzítő nincs inicializálva.")
+        if self._sct is None:
+            self._sct = mss()
 
-        monitors = self._sct.monitors
+        monitors = getattr(self._sct, "monitors", []) or []
         if not monitors:
             raise RuntimeError("Nem található monitor a képernyőmegosztáshoz.")
 
+        if monitors != self._monitors_cache:
+            self._monitors_cache = list(monitors)
+
         if self._monitor_index >= len(monitors):
-            self._monitor_index = self._sanitize_monitor_index(self._monitor_index)
+            self._monitor_index = self._sanitize_monitor_index(self._monitor_index, monitors)
 
         mon = monitors[self._monitor_index]
 
@@ -136,18 +146,33 @@ class ScreenShareTrack(VideoStreamTrack):
         self._last_ts = time.perf_counter()
 
         try:
-            frame = await asyncio.get_running_loop().run_in_executor(None, self._grab_frame)
+            loop = asyncio.get_running_loop()
+            if not self._capture_executor:
+                raise RuntimeError("A képernyő rögzítő végrehajtó le lett állítva.")
+            frame = await loop.run_in_executor(self._capture_executor, self._grab_frame)
         except Exception as exc:
             logger.exception("Képernyőkép készítése sikertelen: %s", exc)
             w, h = self._size or (640, 360)
             black = np.zeros((h, w, 3), dtype=np.uint8)
             frame = VideoFrame.from_ndarray(black, format="rgb24")
 
-        frame.pts, frame.time_base = self.next_timestamp()
+        pts, time_base = await self.next_timestamp()
+        frame.pts = pts
+        frame.time_base = time_base
         return frame
 
     async def stop(self) -> None:
         await super().stop()
+        loop = asyncio.get_running_loop()
+        executor = self._capture_executor
+        if executor:
+            try:
+                await loop.run_in_executor(executor, self._close_capture_resources)
+            finally:
+                self._capture_executor = None
+                await loop.run_in_executor(None, executor.shutdown, True)
+
+    def _close_capture_resources(self) -> None:
         if self._sct:
             try:
                 self._sct.close()
