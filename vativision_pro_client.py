@@ -537,6 +537,7 @@ class Main(QtWidgets.QMainWindow):
 
         share = QtWidgets.QGroupBox("Képernyőmegosztás (küldő)")
         sh = QtWidgets.QGridLayout(share)
+        self.share_group = share
 
         self.res_combo = QtWidgets.QComboBox()
         for label in RESOLUTIONS.keys():
@@ -592,9 +593,7 @@ class Main(QtWidgets.QMainWindow):
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
 
-        self.role_combo.currentTextChanged.connect(
-            lambda value: self._save_setting("ui/role", value)
-        )
+        self.role_combo.currentIndexChanged.connect(self.on_role_changed)
         self.chk_relay.toggled.connect(
             lambda checked: self._save_setting("ui/prefer_relay", checked)
         )
@@ -603,6 +602,7 @@ class Main(QtWidgets.QMainWindow):
         )
 
         self._restore_settings()
+        self._update_role_ui(self.role_combo.currentData() or "sender")
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -667,6 +667,13 @@ class Main(QtWidgets.QMainWindow):
         if self.core:
             self.log_ui_message("Képernyőmegosztás leállítása.")
             asyncio.create_task(self.core.stop_share())
+
+    @QtCore.Slot(int)
+    def on_role_changed(self, index: int) -> None:
+        role_label = self.role_combo.itemText(index)
+        role_value = self.role_combo.itemData(index) or "sender"
+        self._save_setting("ui/role", role_label)
+        self._update_role_ui(role_value)
 
     @QtCore.Slot()
     def on_res_changed(self):
@@ -745,6 +752,10 @@ class Main(QtWidgets.QMainWindow):
 
     def _save_setting(self, key: str, value) -> None:
         self.settings.setValue(key, value)
+
+    def _update_role_ui(self, role_value: str) -> None:
+        is_sender = role_value == "sender"
+        self.share_group.setVisible(is_sender)
 
     @staticmethod
     def _to_bool(value) -> bool:
