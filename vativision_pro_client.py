@@ -211,6 +211,10 @@ class Core(QtCore.QObject):
         self._video_sender = None
         self._target_bitrate_bps: Optional[int] = None
 
+        self._pending_answer: Optional[asyncio.Future] = None
+        self._offer_lock = asyncio.Lock()
+        self._waiting_for_answer_logged = False
+
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
         self.log.emit(message)
@@ -251,13 +255,7 @@ class Core(QtCore.QObject):
             raise RuntimeError("Signaling hello failed")
 
         if self.role == "sender":
-            offer = await self.pc.createOffer()
-            await self.pc.setLocalDescription(offer)
-            await wait_ice_complete(self.pc)
-            await self.ws.send_json({"op":"offer","sdp":{
-                "type": self.pc.localDescription.type,
-                "sdp":  self.pc.localDescription.sdp,
-            }})
+            await self._create_and_send_offer()
 
         asyncio.create_task(self._ws_loop())
         self.status.emit("Várakozás a partnerre...")
@@ -317,6 +315,54 @@ class Core(QtCore.QObject):
         if isinstance(m, (bytes, bytearray)) and self._bw_recv_active:
             self._bw_recv_bytes += len(m)
 
+    async def _wait_for_pending_answer(self) -> None:
+        fut = self._pending_answer
+        if fut and not fut.done():
+            if not self._waiting_for_answer_logged:
+                self._emit_log(
+                    "Várakozás a korábbi ajánlatra érkező válaszra a következő művelet előtt.",
+                    logging.INFO,
+                )
+                self._waiting_for_answer_logged = True
+            try:
+                await asyncio.shield(fut)
+            except Exception:
+                pass
+            finally:
+                self._waiting_for_answer_logged = False
+
+    async def _create_and_send_offer(self) -> None:
+        if not self.pc:
+            raise RuntimeError("Nincs aktív PeerConnection az ajánlat küldéséhez.")
+        if not self.ws:
+            raise RuntimeError("A jelzéscsatorna nem elérhető az ajánlat küldéséhez.")
+
+        await self._wait_for_pending_answer()
+
+        async with self._offer_lock:
+            offer = await self.pc.createOffer()
+            await self.pc.setLocalDescription(offer)
+            await wait_ice_complete(self.pc)
+
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            self._pending_answer = fut
+
+            try:
+                await self.ws.send_json({
+                    "op": "offer",
+                    "sdp": {
+                        "type": self.pc.localDescription.type,
+                        "sdp": self.pc.localDescription.sdp,
+                    },
+                })
+            except Exception as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+                self._pending_answer = None
+                self._waiting_for_answer_logged = False
+                raise
+
     async def _ws_loop(self):
         try:
             async for m in self.ws:
@@ -336,7 +382,20 @@ class Core(QtCore.QObject):
                     }})
                 elif op == "answer" and self.role == "sender":
                     sdp = data["sdp"]
-                    await self.pc.setRemoteDescription(RTCSessionDescription(**sdp))
+                    try:
+                        await self.pc.setRemoteDescription(RTCSessionDescription(**sdp))
+                    except Exception as e:
+                        self._emit_log(f"Távoli SDP beállítása sikertelen: {e}", logging.ERROR)
+                        if self._pending_answer and not self._pending_answer.done():
+                            self._pending_answer.set_exception(e)
+                        self._pending_answer = None
+                        self._waiting_for_answer_logged = False
+                        break
+                    else:
+                        if self._pending_answer and not self._pending_answer.done():
+                            self._pending_answer.set_result(True)
+                        self._pending_answer = None
+                        self._waiting_for_answer_logged = False
         except Exception as e:
             self._emit_log(f"WS loop ended: {e}", logging.ERROR)
 
@@ -397,13 +456,7 @@ class Core(QtCore.QObject):
         except Exception as e:
             self._emit_log(f"[media] setParameters hiba (indítás): {e}", logging.ERROR)
 
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        await wait_ice_complete(self.pc)
-        await self.ws.send_json({"op":"offer","sdp":{
-            "type": self.pc.localDescription.type,
-            "sdp":  self.pc.localDescription.sdp,
-        }})
+        await self._create_and_send_offer()
         self._emit_log("[media] Képernyőmegosztás elindítva.")
 
     async def stop_share(self):
@@ -417,13 +470,7 @@ class Core(QtCore.QObject):
             except Exception: pass
             self._share_track = None
         try:
-            offer = await self.pc.createOffer()
-            await self.pc.setLocalDescription(offer)
-            await wait_ice_complete(self.pc)
-            await self.ws.send_json({"op":"offer","sdp":{
-                "type": self.pc.localDescription.type,
-                "sdp":  self.pc.localDescription.sdp,
-            }})
+            await self._create_and_send_offer()
         except Exception as e:
             self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
         self._emit_log("[media] Képernyőmegosztás leállítva.")
@@ -479,6 +526,10 @@ class Core(QtCore.QObject):
         try:
             if self.pc: await self.pc.close()
         except: pass
+        if self._pending_answer and not self._pending_answer.done():
+            self._pending_answer.cancel()
+        self._pending_answer = None
+        self._waiting_for_answer_logged = False
         self.status.emit("Leállítva")
 
 class Main(QtWidgets.QMainWindow):
