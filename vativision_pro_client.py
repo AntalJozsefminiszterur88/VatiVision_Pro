@@ -7,7 +7,7 @@ import sys
 import ctypes
 from logging.handlers import RotatingFileHandler
 from time import perf_counter
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -119,6 +119,7 @@ ROOM_PIN     = "428913"
 STUN_URLS    = ["stun:stun.l.google.com:19302"]
 APP_TITLE    = "VatiVision Pro - UMKGL Solutions"
 APP_ICON_PATH = Path(__file__).resolve().parent / "program_logo.png"
+CURSOR_PATH   = Path(__file__).resolve().parent / "cursor.png"
 
 BW_SECONDS   = 5.0
 BW_CHUNK     = 16 * 1024
@@ -167,6 +168,117 @@ class AnimatedButton(QtWidgets.QPushButton):
         self._animate_strength(0.0, 180)
 
 
+class PointerCanvas(QtWidgets.QWidget):
+    """Widget that renders video frames with an optional overlay cursor."""
+
+    pointerClicked = QtCore.Signal(float, float)
+    pointerCleared = QtCore.Signal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, *, interactive: bool = True):
+        super().__init__(parent)
+        self._interactive = interactive
+        self._pixmap: Optional[QtGui.QPixmap] = None
+        self._target_rect = QtCore.QRect()
+        self._pointer_visible = False
+        self._pointer_pos = QtCore.QPointF(0.0, 0.0)
+        self._cursor_pixmap = QtGui.QPixmap(str(CURSOR_PATH)) if CURSOR_PATH.exists() else QtGui.QPixmap()
+        self._placeholder = "Nincs bejövő videó"
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
+        self.setMouseTracking(interactive)
+        if interactive:
+            self.setCursor(QtCore.Qt.CrossCursor)
+
+    def set_placeholder(self, text: str) -> None:
+        self._placeholder = text
+        self.update()
+
+    def set_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._pixmap = pixmap
+        self.update()
+
+    def show_pointer(self, norm_x: float, norm_y: float) -> None:
+        self._pointer_visible = True
+        self._pointer_pos = QtCore.QPointF(float(norm_x), float(norm_y))
+        self.update()
+
+    def clear_pointer(self) -> None:
+        if not self._pointer_visible:
+            return
+        self._pointer_visible = False
+        self.update()
+
+    def has_pixmap(self) -> bool:
+        return bool(self._pixmap and not self._pixmap.isNull())
+
+    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        return QtCore.QSize(640, 360)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QtGui.QColor("#1e1f22"))
+
+        if not self.has_pixmap():
+            painter.setPen(QtGui.QColor("#888888"))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._placeholder)
+            self._target_rect = QtCore.QRect()
+            painter.setPen(QtGui.QPen(QtGui.QColor("#3a3c41")))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+            return
+
+        pix = self._pixmap
+        assert pix is not None
+        scaled = pix.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        target = QtCore.QRect(x, y, scaled.width(), scaled.height())
+        self._target_rect = target
+        painter.drawPixmap(target.topLeft(), scaled)
+
+        if self._pointer_visible and not self._cursor_pixmap.isNull():
+            cursor = self._cursor_pixmap
+            cur_w = cursor.width()
+            cur_h = cursor.height()
+            if target.width() > 0 and target.height() > 0:
+                nx = max(0.0, min(1.0, float(self._pointer_pos.x())))
+                ny = max(0.0, min(1.0, float(self._pointer_pos.y())))
+                px = target.left() + int(round(nx * max(0, target.width() - 1)))
+                py = target.top() + int(round(ny * max(0, target.height() - 1)))
+                px = max(target.left(), min(px, target.right() - cur_w + 1))
+                py = max(target.top(), min(py, target.bottom() - cur_h + 1))
+                painter.drawPixmap(px, py, cursor)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#3a3c41")))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if not self._interactive:
+            return super().mousePressEvent(event)
+
+        if event.button() == QtCore.Qt.RightButton:
+            self.pointerCleared.emit()
+            event.accept()
+            return
+
+        if event.button() == QtCore.Qt.LeftButton and self.has_pixmap():
+            if not self._target_rect.contains(event.position().toPoint()):
+                return
+            target = self._target_rect
+            if target.width() <= 0 or target.height() <= 0:
+                return
+            rel_x = (event.position().x() - target.left()) / float(target.width())
+            rel_y = (event.position().y() - target.top()) / float(target.height())
+            rel_x = min(max(rel_x, 0.0), 1.0)
+            rel_y = min(max(rel_y, 0.0), 1.0)
+            self.pointerClicked.emit(rel_x, rel_y)
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+
 class FullscreenViewer(QtWidgets.QWidget):
     """Window that displays the shared video feed in fullscreen."""
 
@@ -179,14 +291,10 @@ class FullscreenViewer(QtWidgets.QWidget):
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
 
-        self._pixmap: Optional[QtGui.QPixmap] = None
-
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.label = QtWidgets.QLabel()
-        self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.label.setStyleSheet("background-color: black;")
-        layout.addWidget(self.label, 1)
+        self.canvas = PointerCanvas(self, interactive=False)
+        layout.addWidget(self.canvas, 1)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key_Escape:
@@ -199,24 +307,14 @@ class FullscreenViewer(QtWidgets.QWidget):
         self.closed.emit()
         super().closeEvent(event)
 
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        self._update_scaled_pixmap()
-        super().resizeEvent(event)
-
     def update_pixmap(self, pixmap: QtGui.QPixmap) -> None:
-        self._pixmap = pixmap
-        self._update_scaled_pixmap()
+        self.canvas.set_pixmap(pixmap)
 
-    def _update_scaled_pixmap(self) -> None:
-        if not self._pixmap:
-            self.label.clear()
-            return
-        if self.width() <= 0 or self.height() <= 0:
-            return
-        scaled = self._pixmap.scaled(
-            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        )
-        self.label.setPixmap(scaled)
+    def update_pointer(self, norm_x: float, norm_y: float) -> None:
+        self.canvas.show_pointer(norm_x, norm_y)
+
+    def clear_pointer(self) -> None:
+        self.canvas.clear_pointer()
 
 
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
@@ -248,6 +346,8 @@ class Core(QtCore.QObject):
     log         = QtCore.Signal(str)
     msg_in      = QtCore.Signal(str)
     video_frame = QtCore.Signal(QtGui.QImage)
+    pointer_update = QtCore.Signal(float, float)
+    pointer_cleared = QtCore.Signal()
 
     def __init__(self, role: str, prefer_relay: bool):
         super().__init__()
@@ -273,6 +373,7 @@ class Core(QtCore.QObject):
         self._pending_answer: Optional[asyncio.Future] = None
         self._offer_lock = asyncio.Lock()
         self._waiting_for_answer_logged = False
+        self._last_pointer: Optional[Tuple[float, float]] = None
 
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
@@ -368,6 +469,20 @@ class Core(QtCore.QObject):
                 self.msg_in.emit(m)
                 if self._bw_report_fut and not self._bw_report_fut.done():
                     self._bw_report_fut.set_result(m)
+                return
+            if m.startswith("PTR "):
+                parts = m.split()
+                if len(parts) == 3:
+                    try:
+                        nx = float(parts[1])
+                        ny = float(parts[2])
+                    except ValueError:
+                        self._emit_log(f"[pointer] Hibás koordináták: {m}", logging.WARNING)
+                    else:
+                        self._register_pointer_update(nx, ny)
+                return
+            if m == "PTR_CLEAR":
+                self._register_pointer_clear()
                 return
             self.msg_in.emit(str(m)); return
 
@@ -539,6 +654,9 @@ class Core(QtCore.QObject):
         self._share_track = ScreenShareTrack(width=width, height=height, fps=fps)
         self._video_sender = self.pc.addTrack(self._share_track)
 
+        if self._last_pointer and self.role == "sender":
+            self._share_track.set_pointer(*self._last_pointer)
+
         self._target_bitrate_bps = max(50_000, int(bitrate_kbps) * 1000)
         try:
             get_params = getattr(self._video_sender, "getParameters", None)
@@ -568,6 +686,8 @@ class Core(QtCore.QObject):
             try: await self._share_track.stop()
             except Exception: pass
             self._share_track = None
+        self._last_pointer = None
+        self.pointer_cleared.emit()
         if renegotiate:
             try:
                 await self._create_and_send_offer()
@@ -616,6 +736,26 @@ class Core(QtCore.QObject):
             except Exception as e:
                 self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
 
+    async def send_pointer(self, norm_x: float, norm_y: float) -> None:
+        if not self.channel or self.channel.readyState != "open":
+            self._emit_log("[pointer] DataChannel nincs nyitva.", logging.WARNING)
+            return
+        message = f"PTR {norm_x:.6f} {norm_y:.6f}"
+        try:
+            self.channel.send(message)
+        except Exception as exc:
+            self._emit_log(f"[pointer] küldési hiba: {exc}", logging.ERROR)
+            return
+        self._emit_log(f"[pointer] Koordináták küldve: ({norm_x:.3f}, {norm_y:.3f})")
+
+    async def clear_remote_pointer(self) -> None:
+        if not self.channel or self.channel.readyState != "open":
+            return
+        try:
+            self.channel.send("PTR_CLEAR")
+        except Exception as exc:
+            self._emit_log(f"[pointer] törlés küldési hiba: {exc}", logging.ERROR)
+
     async def stop(self):
         try:
             await self.stop_share(renegotiate=False)
@@ -632,6 +772,18 @@ class Core(QtCore.QObject):
         except: pass
         self._clear_pending_answer(cancel=True)
         self.status.emit("Leállítva")
+
+    def _register_pointer_update(self, nx: float, ny: float) -> None:
+        self._last_pointer = (nx, ny)
+        self.pointer_update.emit(nx, ny)
+        if self.role == "sender" and self._share_track:
+            self._share_track.set_pointer(nx, ny)
+
+    def _register_pointer_clear(self) -> None:
+        self._last_pointer = None
+        self.pointer_cleared.emit()
+        if self.role == "sender" and self._share_track:
+            self._share_track.clear_pointer()
 
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
@@ -747,13 +899,14 @@ class Main(QtWidgets.QMainWindow):
         vc_layout.setContentsMargins(0, 0, 0, 0)
         vc_layout.setSpacing(6)
 
-        self.video_label = QtWidgets.QLabel("Nincs bejövő videó")
-        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.video_label.setMinimumHeight(280)
-        self.video_label.setStyleSheet(
-            "QLabel { background-color: #1e1f22; border: 1px solid #3a3c41; border-radius: 8px; }"
+        self.video_view = PointerCanvas(interactive=True)
+        self.video_view.pointerClicked.connect(self.on_video_pointer_clicked)
+        self.video_view.pointerCleared.connect(self.on_video_pointer_cleared)
+        self.video_view.setMinimumHeight(280)
+        self.video_view.setStyleSheet(
+            "PointerCanvas { background-color: #1e1f22; border: 1px solid #3a3c41; border-radius: 8px; }"
         )
-        vc_layout.addWidget(self.video_label, 1)
+        vc_layout.addWidget(self.video_view, 1)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.addStretch(1)
@@ -804,6 +957,7 @@ class Main(QtWidgets.QMainWindow):
         self._update_role_ui(self.role_combo.currentData() or "sender")
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
+        self._current_pointer: Optional[Tuple[float, float]] = None
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -843,6 +997,8 @@ class Main(QtWidgets.QMainWindow):
         self.core.log.connect(self.append_log_message)
         self.core.msg_in.connect(self.inbox.appendPlainText)
         self.core.video_frame.connect(self.update_video)
+        self.core.pointer_update.connect(self.on_pointer_update)
+        self.core.pointer_cleared.connect(self.on_pointer_cleared)
 
         async def _run():
             try: await self.core.start()
@@ -855,6 +1011,10 @@ class Main(QtWidgets.QMainWindow):
         if not self.core: return
         core = self.core; self.core = None
         self.log_ui_message("Kapcsolat leállítása kezdeményezve.")
+        self._current_pointer = None
+        self.video_view.clear_pointer()
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.clear_pointer()
         asyncio.create_task(core.stop())
 
     @QtCore.Slot()
@@ -916,28 +1076,60 @@ class Main(QtWidgets.QMainWindow):
         self._pending_bitrate = val
         self._br_debounce.start(200)
 
+    @QtCore.Slot(float, float)
+    def on_video_pointer_clicked(self, nx: float, ny: float) -> None:
+        self._current_pointer = (nx, ny)
+        self.video_view.show_pointer(nx, ny)
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.update_pointer(nx, ny)
+        if self.core and self.core.role == "receiver":
+            self.log_ui_message(
+                f"Mutató pozíció küldése: x={nx:.2f}, y={ny:.2f}"
+            )
+            asyncio.create_task(self.core.send_pointer(nx, ny))
+
+    @QtCore.Slot()
+    def on_video_pointer_cleared(self) -> None:
+        if self._current_pointer is None:
+            return
+        self._current_pointer = None
+        self.video_view.clear_pointer()
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.clear_pointer()
+        if self.core and self.core.role == "receiver":
+            self.log_ui_message("Mutató törlése küldése")
+            asyncio.create_task(self.core.clear_remote_pointer())
+
+    @QtCore.Slot(float, float)
+    def on_pointer_update(self, nx: float, ny: float) -> None:
+        self._current_pointer = (nx, ny)
+        self.video_view.show_pointer(nx, ny)
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.update_pointer(nx, ny)
+        self.inbox.appendPlainText(f"Mutató érkezett: x={nx:.2f}, y={ny:.2f}")
+
+    @QtCore.Slot()
+    def on_pointer_cleared(self) -> None:
+        self._current_pointer = None
+        self.video_view.clear_pointer()
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.clear_pointer()
+        self.inbox.appendPlainText("Mutató törlése érkezett")
+
     @QtCore.Slot(QtGui.QImage)
     def update_video(self, img: QtGui.QImage):
         if img.isNull(): return
         pix = QtGui.QPixmap.fromImage(img)
         self._last_pixmap = pix
+        self.video_view.set_pixmap(pix)
         if self.fullscreen_window and self.fullscreen_window.isVisible():
             self.fullscreen_window.update_pixmap(pix)
-        scaled = pix.scaled(
-            self.video_label.size(),
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
-        )
-        self.video_label.setPixmap(scaled)
+            if self._current_pointer:
+                self.fullscreen_window.update_pointer(*self._current_pointer)
 
     def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
         if self._last_pixmap:
-            scaled = self._last_pixmap.scaled(
-                self.video_label.size(),
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
-            )
-            self.video_label.setPixmap(scaled)
+            self.video_view.set_pixmap(self._last_pixmap)
         return super().resizeEvent(e)
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
@@ -1024,6 +1216,10 @@ class Main(QtWidgets.QMainWindow):
 
         if self._last_pixmap:
             self.fullscreen_window.update_pixmap(self._last_pixmap)
+        if self._current_pointer:
+            self.fullscreen_window.update_pointer(*self._current_pointer)
+        else:
+            self.fullscreen_window.clear_pointer()
         self.fullscreen_window.showFullScreen()
         self.fullscreen_window.activateWindow()
         self.btn_fullscreen.setText("Kilépés a teljes képernyőből")

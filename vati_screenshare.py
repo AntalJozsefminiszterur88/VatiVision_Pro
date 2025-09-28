@@ -3,6 +3,7 @@ import concurrent.futures
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -54,6 +55,10 @@ class ScreenShareTrack(VideoStreamTrack):
         )
         self._init_capture()
 
+        self._pointer_visible = False
+        self._pointer_pos: Tuple[float, float] = (0.0, 0.0)
+        self._cursor_image = self._load_cursor_image()
+
     def set_size(self, width: int, height: int):
         self._size = (int(width), int(height))
 
@@ -66,6 +71,50 @@ class ScreenShareTrack(VideoStreamTrack):
 
     def set_region(self, region: Optional[Tuple[int, int, int, int]]):
         self._region = region
+
+    def set_pointer(self, norm_x: float, norm_y: float) -> None:
+        self._pointer_visible = True
+        self._pointer_pos = (float(norm_x), float(norm_y))
+
+    def clear_pointer(self) -> None:
+        self._pointer_visible = False
+
+    def _load_cursor_image(self):
+        cursor_path = Path(__file__).resolve().parent / "cursor.png"
+        if not cursor_path.exists():
+            logger.warning("A kurzor ikon (%s) nem található.", cursor_path)
+            return None
+        try:
+            return Image.open(cursor_path).convert("RGBA")
+        except Exception as exc:
+            logger.warning("Nem sikerült betölteni a kurzor ikont: %s", exc)
+            return None
+
+    def _draw_pointer(self, img: Image.Image) -> Image.Image:
+        if not self._pointer_visible or not self._cursor_image:
+            return img
+
+        try:
+            width, height = img.size
+            px = float(self._pointer_pos[0])
+            py = float(self._pointer_pos[1])
+        except Exception:
+            return img
+
+        px = max(0.0, min(1.0, px))
+        py = max(0.0, min(1.0, py))
+
+        cursor = self._cursor_image
+        cur_w, cur_h = cursor.size
+
+        target_x = int(round(px * max(0, width - 1)))
+        target_y = int(round(py * max(0, height - 1)))
+        target_x = max(0, min(target_x, max(0, width - cur_w)))
+        target_y = max(0, min(target_y, max(0, height - cur_h)))
+
+        base = img.convert("RGBA")
+        base.alpha_composite(cursor, (target_x, target_y))
+        return base.convert("RGB")
 
     def _init_capture(self):
         self._monitors_cache = []
@@ -137,6 +186,7 @@ class ScreenShareTrack(VideoStreamTrack):
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         if self._size and raw.size != self._size:
             img = img.resize(self._size, Image.LANCZOS)
+        img = self._draw_pointer(img)
         return VideoFrame.from_image(img)
 
     async def recv(self) -> VideoFrame:
