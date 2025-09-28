@@ -130,7 +130,10 @@ class ScreenShareTrack(VideoStreamTrack):
                 "height": int(mon["height"]),
             }
 
-        raw = self._sct.grab(bbox)
+        try:
+            raw = self._sct.grab(bbox, include_cursor=True)
+        except TypeError:
+            raw = self._sct.grab(bbox)
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         if self._size and raw.size != self._size:
             img = img.resize(self._size, Image.LANCZOS)
