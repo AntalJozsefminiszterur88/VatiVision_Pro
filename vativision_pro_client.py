@@ -651,7 +651,7 @@ class Main(QtWidgets.QMainWindow):
         side.setStyleSheet(f"QFrame {{ background-color:{DARK_CARD}; border-radius:12px; }}")
         s = QtWidgets.QVBoxLayout(side); s.setContentsMargins(12,12,12,12); s.setSpacing(10)
 
-        head = QtWidgets.QLabel(f"<b>VatiVision Pro</b><br>"
+        head = QtWidgets.QLabel(f"<b>VatiVision Pro - UMKGL Solutions</b><br>"
                                 f"WS: <code>{SIGNALING_WS}</code><br>"
                                 f"Szoba: <code>{ROOM_NAME}</code> &nbsp; PIN: <code>{ROOM_PIN}</code>")
         head.setTextFormat(QtCore.Qt.RichText)
