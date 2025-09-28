@@ -1,6 +1,8 @@
 
 # VatiVision Pro — Client (Discord-style UI) — fixed import name
 import asyncio, json
+import logging
+from logging.handlers import RotatingFileHandler
 from time import perf_counter
 from typing import Optional
 from pathlib import Path
@@ -11,6 +13,49 @@ from aiohttp import ClientSession, WSMsgType
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
 
 from vati_screenshare import ScreenShareTrack, RESOLUTIONS
+
+LOG_ROOT = Path.home() / "felhasználó" / "dokumentumok" / "UMKGL Solutions" / "VatiVision_Pro"
+
+
+def _setup_file_logging() -> Path:
+    """Initialise rotating file logging limited to 5 MB in the requested folder."""
+
+    log_dir = LOG_ROOT
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Nem sikerült létrehozni a log könyvtárat: {log_dir}") from exc
+
+    log_path = log_dir / "vativision_pro.log"
+
+    root_logger = logging.getLogger()
+    handler_exists = False
+    for handler in root_logger.handlers:
+        if isinstance(handler, RotatingFileHandler) and getattr(handler, "baseFilename", None) == str(log_path):
+            handler_exists = True
+            break
+
+    if not handler_exists:
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=1,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        root_logger.addHandler(file_handler)
+
+    root_logger.setLevel(logging.INFO)
+
+    logging.captureWarnings(True)
+    return log_path
+
+
+LOG_FILE = _setup_file_logging()
+logger = logging.getLogger(__name__)
+logger.info("Fájllog inicializálva: %s", LOG_FILE)
 
 SIGNALING_WS = "wss://vatib-vezerlo.duckdns.org/ws"
 TURN_HOST    = "vatib-vezerlo.duckdns.org"
@@ -75,6 +120,8 @@ class Core(QtCore.QObject):
         self.ws = None
         self.channel: Optional[RTCDataChannel] = None
 
+        self._logger = logging.getLogger(f"{__name__}.Core")
+
         self._bw_recv_active = False
         self._bw_recv_bytes  = 0
         self._bw_recv_t0     = 0.0
@@ -84,6 +131,10 @@ class Core(QtCore.QObject):
         self._share_track: Optional[ScreenShareTrack] = None
         self._video_sender = None
         self._target_bitrate_bps: Optional[int] = None
+
+    def _emit_log(self, message: str, level: int = logging.INFO) -> None:
+        self._logger.log(level, message)
+        self.log.emit(message)
 
     async def start(self):
         self.status.emit("Indítás...")
@@ -141,7 +192,7 @@ class Core(QtCore.QObject):
                 qimg = QtGui.QImage(img.data, w, h, 3*w, QtGui.QImage.Format_RGB888).copy()
                 self.video_frame.emit(qimg)
         except Exception as e:
-            self.log.emit(f"[media] video consumer ended: {e}")
+            self._emit_log(f"[media] video consumer ended: {e}", logging.ERROR)
 
     def _handle_message(self, m):
         if isinstance(m, str):
@@ -197,7 +248,7 @@ class Core(QtCore.QObject):
                     sdp = data["sdp"]
                     await self.pc.setRemoteDescription(RTCSessionDescription(**sdp))
         except Exception as e:
-            self.log.emit(f"WS loop ended: {e}")
+            self._emit_log(f"WS loop ended: {e}", logging.ERROR)
 
     async def send_ping(self):
         if self.channel and self.channel.readyState == "open":
@@ -205,13 +256,13 @@ class Core(QtCore.QObject):
 
     async def run_bw_test(self, seconds: float = BW_SECONDS, chunk_size: int = BW_CHUNK):
         if not self.channel or self.channel.readyState != "open":
-            self.log.emit("DataChannel nincs nyitva."); return
+            self._emit_log("DataChannel nincs nyitva.", logging.WARNING); return
         loop = asyncio.get_running_loop()
         self._bw_ready_fut = loop.create_future()
         try: self.channel.send(f"BW_BEGIN d={seconds}")
-        except Exception as e: self.log.emit(f"[bw] begin hiba: {e}"); return
+        except Exception as e: self._emit_log(f"[bw] begin hiba: {e}", logging.ERROR); return
         try: await asyncio.wait_for(self._bw_ready_fut, timeout=5.0)
-        except asyncio.TimeoutError: self.log.emit("[bw] receiver timeout"); return
+        except asyncio.TimeoutError: self._emit_log("[bw] receiver timeout", logging.WARNING); return
         finally: self._bw_ready_fut = None
 
         payload = b"\\x00" * chunk_size
@@ -230,12 +281,12 @@ class Core(QtCore.QObject):
         except asyncio.TimeoutError:
             elapsed = max(1e-6, perf_counter() - t0)
             mbps = (sent_bytes * 8) / 1_000_000 / elapsed
-            self.log.emit(f"[bw] sender-est {mbps:.2f} Mb/s")
+            self._emit_log(f"[bw] sender-est {mbps:.2f} Mb/s")
         finally: self._bw_report_fut = None
 
     async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
-        if not self.pc: self.log.emit("Nincs aktív PeerConnection."); return
-        if self._share_track is not None: self.log.emit("Már fut a megosztás."); return
+        if not self.pc: self._emit_log("Nincs aktív PeerConnection.", logging.WARNING); return
+        if self._share_track is not None: self._emit_log("Már fut a megosztás.", logging.WARNING); return
 
         self._share_track = ScreenShareTrack(width=width, height=height, fps=fps)
         self._video_sender = self.pc.addTrack(self._share_track)
@@ -252,9 +303,9 @@ class Core(QtCore.QObject):
                         enc.maxFramerate = max(1, fps)
                 await set_params(params)
             else:
-                self.log.emit("[media] Az aiortc verziód nem támogatja a setParameters-t (bitráta/fps encoder-szinten).")
+                self._emit_log("[media] Az aiortc verziód nem támogatja a setParameters-t (bitráta/fps encoder-szinten).", logging.WARNING)
         except Exception as e:
-            self.log.emit(f"[media] setParameters hiba (indítás): {e}")
+            self._emit_log(f"[media] setParameters hiba (indítás): {e}", logging.ERROR)
 
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
@@ -263,7 +314,7 @@ class Core(QtCore.QObject):
             "type": self.pc.localDescription.type,
             "sdp":  self.pc.localDescription.sdp,
         }})
-        self.log.emit("[media] Képernyőmegosztás elindítva.")
+        self._emit_log("[media] Képernyőmegosztás elindítva.")
 
     async def stop_share(self):
         if not self.pc: return
@@ -284,13 +335,13 @@ class Core(QtCore.QObject):
                 "sdp":  self.pc.localDescription.sdp,
             }})
         except Exception as e:
-            self.log.emit(f"[media] renegotiation hiba (stop_share): {e}")
-        self.log.emit("[media] Képernyőmegosztás leállítva.")
+            self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
+        self._emit_log("[media] Képernyőmegosztás leállítva.")
 
     async def set_resolution(self, width: int, height: int):
         if self._share_track:
             self._share_track.set_size(width, height)
-            self.log.emit(f"[media] Új felbontás: {width}×{height}")
+            self._emit_log(f"[media] Új felbontás: {width}×{height}")
 
     async def set_fps(self, fps: int):
         if self._share_track:
@@ -306,10 +357,10 @@ class Core(QtCore.QObject):
                             enc.maxFramerate = max(1, fps)
                     await set_params(params)
                 else:
-                    self.log.emit("[media] Az aiortc verziód nem támogatja az FPS setParameters-t; a track FPS attól még változik.")
+                    self._emit_log("[media] Az aiortc verziód nem támogatja az FPS setParameters-t; a track FPS attól még változik.", logging.WARNING)
             except Exception as e:
-                self.log.emit(f"[media] setParameters (fps) hiba: {e}")
-        self.log.emit(f"[media] Új FPS: {fps}")
+                self._emit_log(f"[media] setParameters (fps) hiba: {e}", logging.ERROR)
+        self._emit_log(f"[media] Új FPS: {fps}")
 
     async def set_bitrate(self, kbps: int):
         self._target_bitrate_bps = max(50_000, int(kbps) * 1000)
@@ -324,9 +375,9 @@ class Core(QtCore.QObject):
                             enc.maxBitrate = self._target_bitrate_bps
                     await set_params(params)
                 else:
-                    self.log.emit("[media] Az aiortc verziód nem támogatja a bitráta setParameters-t.")
+                    self._emit_log("[media] Az aiortc verziód nem támogatja a bitráta setParameters-t.", logging.WARNING)
             except Exception as e:
-                self.log.emit(f"[media] setParameters (bitrate) hiba: {e}")
+                self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
 
     async def stop(self):
         try:
@@ -348,6 +399,8 @@ class Main(QtWidgets.QMainWindow):
         if APP_ICON_PATH.exists():
             icon = QtGui.QIcon(str(APP_ICON_PATH))
             self.setWindowIcon(icon)
+
+        self.ui_logger = logging.getLogger(f"{__name__}.UI")
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         root = QtWidgets.QHBoxLayout(central); root.setContentsMargins(12,12,12,12); root.setSpacing(12)
@@ -445,67 +498,89 @@ class Main(QtWidgets.QMainWindow):
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
 
+    @QtCore.Slot(str)
+    def append_log_message(self, message: str) -> None:
+        self.log.appendPlainText(message)
+
+    def log_ui_message(self, message: str, level: int = logging.INFO) -> None:
+        self.ui_logger.log(level, message)
+        self.log.appendPlainText(message)
+
     @QtCore.Slot()
     def on_start(self):
         if self.core: return
         role = self.role_combo.currentText(); prefer = self.chk_relay.isChecked()
+        self.log_ui_message(f"Kapcsolat indítása szerep={role}, prefer_relay={prefer}")
         self.core = Core(role=role, prefer_relay=prefer)
         self.core.status.connect(self.status.setText)
-        self.core.log.connect(self.log.appendPlainText)
+        self.core.log.connect(self.append_log_message)
         self.core.msg_in.connect(self.inbox.appendPlainText)
         self.core.video_frame.connect(self.update_video)
 
         async def _run():
             try: await self.core.start()
             except Exception as e:
-                self.log.appendPlainText(f"Indítás hiba: {e}"); self.core = None
+                self.log_ui_message(f"Indítás hiba: {e}", logging.ERROR); self.core = None
         asyncio.create_task(_run())
 
     @QtCore.Slot()
     def on_stop(self):
         if not self.core: return
         core = self.core; self.core = None
+        self.log_ui_message("Kapcsolat leállítása kezdeményezve.")
         asyncio.create_task(core.stop())
 
     @QtCore.Slot()
     def on_ping(self):
         if not self.core: return
+        self.log_ui_message("Ping üzenet küldése.")
         asyncio.create_task(self.core.send_ping())
 
     @QtCore.Slot()
     def on_bw(self):
         if not self.core: return
+        self.log_ui_message("Sávszélesség teszt indítása.")
         asyncio.create_task(self.core.run_bw_test(BW_SECONDS, BW_CHUNK))
 
     @QtCore.Slot()
     def on_share_start(self):
         if not self.core:
-            self.log.appendPlainText("Előbb indítsd el a kapcsolatot."); return
+            self.log_ui_message("Előbb indítsd el a kapcsolatot.", logging.WARNING); return
         label = self.res_combo.currentText()
         width, height = RESOLUTIONS[label]
         fps = self.fps_slider.value(); kbps = self.br_slider.value()
+        self.log_ui_message(
+            f"Képernyőmegosztás indítása: {label}, {fps} FPS, {kbps} kbps"
+        )
         asyncio.create_task(self.core.start_share(width, height, fps, kbps))
 
     @QtCore.Slot()
     def on_share_stop(self):
-        if self.core: asyncio.create_task(self.core.stop_share())
+        if self.core:
+            self.log_ui_message("Képernyőmegosztás leállítása.")
+            asyncio.create_task(self.core.stop_share())
 
     @QtCore.Slot()
     def on_res_changed(self):
         if not self.core: return
         label = self.res_combo.currentText()
         width, height = RESOLUTIONS[label]
+        self.log_ui_message(f"Felbontás váltása: {label}")
         asyncio.create_task(self.core.set_resolution(width, height))
 
     @QtCore.Slot()
     def on_fps_changed(self, val: int):
         self.fps_label.setText(f"FPS: {val}")
-        if self.core: asyncio.create_task(self.core.set_fps(val))
+        if self.core:
+            self.log_ui_message(f"FPS módosítása: {val}")
+            asyncio.create_task(self.core.set_fps(val))
 
     @QtCore.Slot()
     def on_br_changed(self, val: int):
         self.br_label.setText(f"Bitráta: {val} kbps")
-        if self.core: asyncio.create_task(self.core.set_bitrate(val))
+        if self.core:
+            self.log_ui_message(f"Bitráta módosítása: {val} kbps")
+            asyncio.create_task(self.core.set_bitrate(val))
 
     @QtCore.Slot(QtGui.QImage)
     def update_video(self, img: QtGui.QImage):
