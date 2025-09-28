@@ -462,7 +462,9 @@ class Main(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(panel)
 
         row = QtWidgets.QHBoxLayout()
-        self.role_combo = QtWidgets.QComboBox(); self.role_combo.addItems(["sender","receiver"])
+        self.role_combo = QtWidgets.QComboBox()
+        self.role_combo.addItem("Küldő", "sender")
+        self.role_combo.addItem("Fogadó", "receiver")
         row.addWidget(QtWidgets.QLabel("Szerep:")); row.addWidget(self.role_combo); row.addStretch(1)
         v.addLayout(row)
 
@@ -554,9 +556,11 @@ class Main(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def on_start(self):
         if self.core: return
-        role = self.role_combo.currentText(); prefer = self.chk_relay.isChecked()
-        self.log_ui_message(f"Kapcsolat indítása szerep={role}, prefer_relay={prefer}")
-        self.core = Core(role=role, prefer_relay=prefer)
+        role_label = self.role_combo.currentText()
+        role_value = self.role_combo.currentData() or "sender"
+        prefer = self.chk_relay.isChecked()
+        self.log_ui_message(f"Kapcsolat indítása szerep={role_label}, prefer_relay={prefer}")
+        self.core = Core(role=role_value, prefer_relay=prefer)
         self.core.status.connect(self.status.setText)
         self.core.log.connect(self.append_log_message)
         self.core.msg_in.connect(self.inbox.appendPlainText)
