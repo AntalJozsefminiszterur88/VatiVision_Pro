@@ -653,11 +653,6 @@ class Main(QtWidgets.QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
 
-        title_label = QtWidgets.QLabel("VatiVision Pro")
-        title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
-        main_layout.addWidget(title_label, 0, QtCore.Qt.AlignLeft)
-
         root = QtWidgets.QHBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
