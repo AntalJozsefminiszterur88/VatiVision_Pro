@@ -7,7 +7,7 @@ import sys
 import ctypes
 from logging.handlers import RotatingFileHandler
 from time import perf_counter
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -269,28 +269,48 @@ class Core(QtCore.QObject):
         self._share_track: Optional[ScreenShareTrack] = None
         self._video_sender = None
         self._target_bitrate_bps: Optional[int] = None
+        self._share_resume_params: Optional[Tuple[int, int, int, int]] = None
 
         self._pending_answer: Optional[asyncio.Future] = None
         self._offer_lock = asyncio.Lock()
         self._waiting_for_answer_logged = False
+
+        self._stopping = False
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._restart_lock = asyncio.Lock()
+        self._ws_task: Optional[asyncio.Task] = None
 
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
         self.log.emit(message)
 
     async def start(self):
+        self._stopping = False
+        await self._establish_connection()
+
+    async def _establish_connection(self) -> None:
         self.status.emit("Indítás...")
         self.pc = RTCPeerConnection(configuration=make_rtc_config(self.prefer_relay))
 
         @self.pc.on("iceconnectionstatechange")
         def _ice():
-            self.status.emit(f"ICE: {self.pc.iceConnectionState}")
-            if self.pc.iceConnectionState == "connected":
+            state = self.pc.iceConnectionState
+            self.status.emit(f"ICE: {state}")
+            if state == "connected":
                 self.status.emit("ICE: kapcsolódva ✅")
+                self._cancel_scheduled_reconnect()
+            elif state in {"failed", "disconnected"}:
+                delay = 1.0 if state == "failed" else 5.0
+                self._emit_log(
+                    f"ICE állapot: {state}. Újracsatlakozás indítása...",
+                    logging.WARNING,
+                )
+                self._schedule_reconnect(f"ICE állapot: {state}.", delay)
 
         @self.pc.on("datachannel")
         def _dc(ch: RTCDataChannel):
             self.channel = ch
+
             @ch.on("message")
             def _on(m):
                 self._handle_message(m)
@@ -302,21 +322,28 @@ class Core(QtCore.QObject):
 
         if self.role == "sender":
             self.channel = self.pc.createDataChannel("chat")
+
             @self.channel.on("message")
             def _on_msg(m):
                 self._handle_message(m)
 
-        self.session = ClientSession()
-        self.ws = await self.session.ws_connect(SIGNALING_WS, heartbeat=30, autoping=True)
-        await self.ws.send_json({"op":"hello","room":ROOM_NAME,"pin":ROOM_PIN,"role":self.role})
-        hello = await self.ws.receive()
-        if hello.type != WSMsgType.TEXT or json.loads(hello.data).get("op") != "hello_ok":
-            raise RuntimeError("Signaling hello failed")
+        try:
+            self.session = ClientSession()
+            self.ws = await self.session.ws_connect(SIGNALING_WS, heartbeat=30, autoping=True)
+            await self.ws.send_json({"op":"hello","room":ROOM_NAME,"pin":ROOM_PIN,"role":self.role})
+            hello = await self.ws.receive()
+            if hello.type != WSMsgType.TEXT or json.loads(hello.data).get("op") != "hello_ok":
+                raise RuntimeError("Signaling hello failed")
 
-        if self.role == "sender":
-            await self._create_and_send_offer()
+            if self.role == "sender":
+                await self._create_and_send_offer()
+        except Exception:
+            await self._cleanup_connection(for_reconnect=True)
+            raise
 
-        asyncio.create_task(self._ws_loop())
+        ws = self.ws
+        if ws is not None:
+            self._ws_task = asyncio.create_task(self._ws_loop(ws))
         self.status.emit("Várakozás a partnerre...")
 
     async def _consume_video(self, track):
@@ -445,20 +472,23 @@ class Core(QtCore.QObject):
                 self._clear_pending_answer(exc=exc)
                 raise
 
-    async def _ws_loop(self):
+    async def _ws_loop(self, ws):
+        reason: Optional[str] = None
         try:
-            async for m in self.ws:
+            async for m in ws:
                 if m.type != WSMsgType.TEXT:
                     continue
                 data = json.loads(m.data)
                 op = data.get("op")
                 if op == "offer" and self.role == "receiver":
+                    if not self.pc:
+                        continue
                     sdp = data["sdp"]
                     await self.pc.setRemoteDescription(RTCSessionDescription(**sdp))
                     ans = await self.pc.createAnswer()
                     await self.pc.setLocalDescription(ans)
                     await wait_ice_complete(self.pc)
-                    await self.ws.send_json({"op":"answer","sdp":{
+                    await ws.send_json({"op":"answer","sdp":{
                         "type": self.pc.localDescription.type,
                         "sdp":  self.pc.localDescription.sdp,
                     }})
@@ -496,7 +526,124 @@ class Core(QtCore.QObject):
 
                     self._clear_pending_answer(result=True)
         except Exception as e:
-            self._emit_log(f"WS loop ended: {e}", logging.ERROR)
+            reason = f"WS loop ended: {e}"
+            self._emit_log(reason, logging.ERROR)
+        finally:
+            if not self._stopping and self.ws is ws:
+                msg = reason or "A jelzéscsatorna lezárult, újracsatlakozás szükséges."
+                self._schedule_reconnect(msg, delay=3.0)
+
+    def _cancel_scheduled_reconnect(self) -> Optional[asyncio.Task]:
+        task = self._reconnect_task
+        if task and not task.done():
+            task.cancel()
+        self._reconnect_task = None
+        return task
+
+    def _schedule_reconnect(self, reason: str, delay: float = 3.0) -> None:
+        if self._stopping:
+            return
+        delay = max(0.0, delay)
+        display_delay = f"{delay:.1f}" if delay < 1.0 else f"{delay:.0f}"
+        self._emit_log(
+            f"{reason} Újracsatlakozás {display_delay} másodperc múlva...",
+            logging.WARNING,
+        )
+        self.status.emit("Újracsatlakozás előkészítése...")
+        self._cancel_scheduled_reconnect()
+        loop = asyncio.get_running_loop()
+        self._reconnect_task = loop.create_task(self._reconnect_after(delay))
+
+    async def _reconnect_after(self, delay: float):
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._stopping:
+                return
+            self.status.emit("Újracsatlakozás...")
+            await self._restart_connection()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._emit_log(f"Újracsatlakozás sikertelen: {e}", logging.ERROR)
+            if not self._stopping:
+                next_delay = min(max(1.0, delay * 2), 60.0)
+                self._emit_log(
+                    f"Újracsatlakozás újrapróbálása {next_delay:.0f} másodperc múlva.",
+                    logging.WARNING,
+                )
+                self.status.emit("Újracsatlakozás előkészítése...")
+                loop = asyncio.get_running_loop()
+                self._reconnect_task = loop.create_task(self._reconnect_after(next_delay))
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
+
+    async def _restart_connection(self) -> None:
+        async with self._restart_lock:
+            if self._stopping:
+                return
+            self._emit_log("Újracsatlakozási kísérlet folyamatban...")
+            await self._cleanup_connection(for_reconnect=True)
+            await self._establish_connection()
+            self._emit_log("Kapcsolat helyreállt.")
+            self.status.emit("Kapcsolat helyreállt ✅")
+            if self._share_resume_params:
+                width, height, fps, kbps = self._share_resume_params
+                self._emit_log("[media] Képernyőmegosztás automatikus újraindítása.")
+                try:
+                    await self.start_share(width, height, fps, kbps)
+                except Exception as e:
+                    self._emit_log(
+                        f"[media] Automatikus képernyőmegosztás indítása sikertelen: {e}",
+                        logging.ERROR,
+                    )
+
+    async def _cleanup_connection(self, *, for_reconnect: bool) -> None:
+        try:
+            await self.stop_share(renegotiate=False, for_reconnect=for_reconnect)
+        except Exception:
+            pass
+
+        ws = self.ws
+        self.ws = None
+        if ws:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+        session = self.session
+        self.session = None
+        if session:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+        pc = self.pc
+        self.pc = None
+        if pc:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+
+        self.channel = None
+        self._clear_pending_answer(cancel=True)
+
+        ws_task = self._ws_task
+        self._ws_task = None
+        if ws_task:
+            try:
+                await ws_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                self._emit_log(f"WS loop lezárása hibával: {e}", logging.DEBUG)
+
+        if not for_reconnect:
+            self._share_resume_params = None
 
     async def send_ping(self):
         if self.channel and self.channel.readyState == "open":
@@ -533,8 +680,12 @@ class Core(QtCore.QObject):
         finally: self._bw_report_fut = None
 
     async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
-        if not self.pc: self._emit_log("Nincs aktív PeerConnection.", logging.WARNING); return
-        if self._share_track is not None: self._emit_log("Már fut a megosztás.", logging.WARNING); return
+        if not self.pc:
+            self._emit_log("Nincs aktív PeerConnection.", logging.WARNING)
+            return
+        if self._share_track is not None:
+            self._emit_log("Már fut a megosztás.", logging.WARNING)
+            return
 
         self._share_track = ScreenShareTrack(width=width, height=height, fps=fps)
         self._video_sender = self.pc.addTrack(self._share_track)
@@ -551,34 +702,48 @@ class Core(QtCore.QObject):
                         enc.maxFramerate = max(1, fps)
                 await set_params(params)
             else:
-                self._emit_log("[media] Az aiortc verziód nem támogatja a setParameters-t (bitráta/fps encoder-szinten).", logging.WARNING)
+                self._emit_log(
+                    "[media] Az aiortc verziód nem támogatja a setParameters-t (bitráta/fps encoder-szinten).",
+                    logging.WARNING,
+                )
         except Exception as e:
             self._emit_log(f"[media] setParameters hiba (indítás): {e}", logging.ERROR)
 
+        params_snapshot = (width, height, fps, bitrate_kbps)
         await self._create_and_send_offer()
+        self._share_resume_params = params_snapshot
         self._emit_log("[media] Képernyőmegosztás elindítva.")
 
-    async def stop_share(self, *, renegotiate: bool = True):
-        if not self.pc: return
+    async def stop_share(self, *, renegotiate: bool = True, for_reconnect: bool = False):
         if self._video_sender:
-            try: self.pc.removeTrack(self._video_sender)
-            except Exception: pass
+            if self.pc:
+                try:
+                    self.pc.removeTrack(self._video_sender)
+                except Exception:
+                    pass
             self._video_sender = None
         if self._share_track:
-            try: await self._share_track.stop()
-            except Exception: pass
+            try:
+                await self._share_track.stop()
+            except Exception:
+                pass
             self._share_track = None
-        if renegotiate:
+        if renegotiate and self.pc:
             try:
                 await self._create_and_send_offer()
             except Exception as e:
                 self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
+        if not for_reconnect:
+            self._share_resume_params = None
         self._emit_log("[media] Képernyőmegosztás leállítva.")
 
     async def set_resolution(self, width: int, height: int):
         if self._share_track:
             self._share_track.set_size(width, height)
             self._emit_log(f"[media] Új felbontás: {width}×{height}")
+        if self._share_resume_params:
+            _, _, fps, kbps = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps)
 
     async def set_fps(self, fps: int):
         if self._share_track:
@@ -598,6 +763,9 @@ class Core(QtCore.QObject):
             except Exception as e:
                 self._emit_log(f"[media] setParameters (fps) hiba: {e}", logging.ERROR)
         self._emit_log(f"[media] Új FPS: {fps}")
+        if self._share_resume_params:
+            width, height, _, kbps = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps)
 
     async def set_bitrate(self, kbps: int):
         self._target_bitrate_bps = max(50_000, int(kbps) * 1000)
@@ -615,22 +783,19 @@ class Core(QtCore.QObject):
                     self._emit_log("[media] Az aiortc verziód nem támogatja a bitráta setParameters-t.", logging.WARNING)
             except Exception as e:
                 self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
+        if self._share_resume_params:
+            width, height, fps, _ = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps)
 
     async def stop(self):
-        try:
-            await self.stop_share(renegotiate=False)
-        except Exception:
-            pass
-        try:
-            if self.ws: await self.ws.close()
-        except: pass
-        try:
-            if self.session: await self.session.close()
-        except: pass
-        try:
-            if self.pc: await self.pc.close()
-        except: pass
-        self._clear_pending_answer(cancel=True)
+        self._stopping = True
+        task = self._cancel_scheduled_reconnect()
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._cleanup_connection(for_reconnect=False)
         self.status.emit("Leállítva")
 
 class Main(QtWidgets.QMainWindow):
