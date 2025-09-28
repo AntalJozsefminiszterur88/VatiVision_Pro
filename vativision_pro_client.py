@@ -587,6 +587,10 @@ class Main(QtWidgets.QMainWindow):
 
         self.ui_logger = logging.getLogger(f"{__name__}.UI")
 
+        self.tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
+        self._tray_force_quit = False
+        self._tray_message_shown = False
+
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         root = QtWidgets.QHBoxLayout(central); root.setContentsMargins(12,12,12,12); root.setSpacing(12)
 
@@ -627,7 +631,13 @@ class Main(QtWidgets.QMainWindow):
         self.btn_stop  = AnimatedButton("Leállítás")
         self.btn_ping  = AnimatedButton("Ping küldése (Küldő)")
         self.btn_bw    = AnimatedButton("Sávszél-teszt")
-        row2.addWidget(self.btn_start); row2.addWidget(self.btn_stop); row2.addWidget(self.btn_ping); row2.addWidget(self.btn_bw); row2.addStretch(1)
+        self.btn_tray  = AnimatedButton("Tálcára helyezés")
+        row2.addWidget(self.btn_start)
+        row2.addWidget(self.btn_stop)
+        row2.addWidget(self.btn_ping)
+        row2.addWidget(self.btn_bw)
+        row2.addWidget(self.btn_tray)
+        row2.addStretch(1)
         v.addLayout(row2)
 
         share = QtWidgets.QGroupBox("Képernyőmegosztás (küldő)")
@@ -687,6 +697,7 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
+        self.btn_tray.clicked.connect(self.minimize_to_tray)
 
         self.role_combo.currentIndexChanged.connect(self.on_role_changed)
         self.chk_relay.toggled.connect(
@@ -698,6 +709,7 @@ class Main(QtWidgets.QMainWindow):
 
         self._restore_settings()
         self._update_role_ui(self.role_combo.currentData() or "sender")
+        self._setup_tray_icon()
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -809,9 +821,68 @@ class Main(QtWidgets.QMainWindow):
                 self.video_label.setPixmap(scaled)
         return super().resizeEvent(e)
 
+    def minimize_to_tray(self) -> None:
+        if not self.tray_icon:
+            self.log_ui_message("A rendszer nem támogatja a tálca funkciót.", logging.WARNING)
+            return
+
+        self.hide()
+        if not self._tray_message_shown:
+            self.tray_icon.showMessage(
+                APP_TITLE,
+                "Az alkalmazás tovább fut a tálcán.",
+                QtWidgets.QSystemTrayIcon.Information,
+                3000,
+            )
+            self._tray_message_shown = True
+
+    def restore_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QtWidgets.QSystemTrayIcon.Trigger, QtWidgets.QSystemTrayIcon.DoubleClick):
+            self.restore_from_tray()
+
+    def _quit_from_tray(self) -> None:
+        self._tray_force_quit = True
+        if self.tray_icon:
+            self.tray_icon.hide()
+        self.close()
+
+    def _setup_tray_icon(self) -> None:
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            self.ui_logger.warning("A rendszer nem támogatja a tálca ikont.")
+            return
+
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+
+        tray_icon = QtWidgets.QSystemTrayIcon(icon, self)
+        tray_icon.setToolTip(APP_TITLE)
+
+        menu = QtWidgets.QMenu()
+        act_restore = menu.addAction("Megnyitás")
+        act_restore.triggered.connect(self.restore_from_tray)
+        menu.addSeparator()
+        act_exit = menu.addAction("Kilépés")
+        act_exit.triggered.connect(self._quit_from_tray)
+
+        tray_icon.setContextMenu(menu)
+        tray_icon.activated.connect(self._on_tray_activated)
+        tray_icon.show()
+        self.tray_icon = tray_icon
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._save_setting("window/geometry", self.saveGeometry())
         self.settings.sync()
+        if self.tray_icon and not self._tray_force_quit:
+            event.ignore()
+            self.minimize_to_tray()
+            return
+
         super().closeEvent(event)
 
     def _restore_settings(self) -> None:
@@ -871,6 +942,7 @@ class Main(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication([])
+    app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(style())
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
