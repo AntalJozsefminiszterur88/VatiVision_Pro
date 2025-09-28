@@ -227,6 +227,17 @@ class Core(QtCore.QObject):
 
     def _handle_message(self, m):
         if isinstance(m, str):
+            if m == "ping":
+                self.msg_in.emit("Ping érkezett ✅")
+                if self.channel and self.channel.readyState == "open":
+                    try:
+                        self.channel.send("pong")
+                    except Exception as exc:
+                        self._emit_log(f"Ping visszajelzés küldési hiba: {exc}", logging.WARNING)
+                return
+            if m == "pong":
+                self.msg_in.emit("Pong visszaigazolás megérkezett ✅")
+                return
             if m.startswith("BW_BEGIN"):
                 self._bw_recv_active = True
                 self._bw_recv_bytes  = 0
