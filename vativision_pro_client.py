@@ -36,6 +36,37 @@ def style():
     QCheckBox {{ background:transparent; }}
     """
 
+
+class AnimatedButton(QtWidgets.QPushButton):
+    """QPushButton subclass that animates a subtle highlight when pressed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._effect = QtWidgets.QGraphicsColorizeEffect(self)
+        self._effect.setColor(QtGui.QColor("#ffffff"))
+        self._effect.setStrength(0.0)
+        self.setGraphicsEffect(self._effect)
+
+        self._anim = QtCore.QPropertyAnimation(self._effect, b"strength", self)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+
+        self.pressed.connect(self._on_pressed)
+        self.released.connect(self._on_released)
+
+    def _animate_strength(self, target: float, duration: int):
+        self._anim.stop()
+        self._anim.setDuration(duration)
+        self._anim.setStartValue(self._effect.strength())
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def _on_pressed(self):
+        self._animate_strength(0.45, 110)
+
+    def _on_released(self):
+        self._animate_strength(0.0, 180)
+
+
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
     ice_servers = [
         RTCIceServer(urls=STUN_URLS),
@@ -383,10 +414,10 @@ class Main(QtWidgets.QMainWindow):
         v.addLayout(row)
 
         row2 = QtWidgets.QHBoxLayout()
-        self.btn_start = QtWidgets.QPushButton("Kapcsolat indítása")
-        self.btn_stop  = QtWidgets.QPushButton("Leállítás")
-        self.btn_ping  = QtWidgets.QPushButton("Ping küldése (Küldő)")
-        self.btn_bw    = QtWidgets.QPushButton("Sávszél-teszt")
+        self.btn_start = AnimatedButton("Kapcsolat indítása")
+        self.btn_stop  = AnimatedButton("Leállítás")
+        self.btn_ping  = AnimatedButton("Ping küldése (Küldő)")
+        self.btn_bw    = AnimatedButton("Sávszél-teszt")
         row2.addWidget(self.btn_start); row2.addWidget(self.btn_stop); row2.addWidget(self.btn_ping); row2.addWidget(self.btn_bw); row2.addStretch(1)
         v.addLayout(row2)
 
@@ -406,8 +437,8 @@ class Main(QtWidgets.QMainWindow):
         self.br_slider.setRange(100, 50000); self.br_slider.setSingleStep(50); self.br_slider.setValue(4000)
         self.br_label = QtWidgets.QLabel("Bitráta: 4000 kbps")
 
-        self.btn_share_start = QtWidgets.QPushButton("Megosztás indítása")
-        self.btn_share_stop  = QtWidgets.QPushButton("Megosztás leállítása")
+        self.btn_share_start = AnimatedButton("Megosztás indítása")
+        self.btn_share_stop  = AnimatedButton("Megosztás leállítása")
 
         sh.addWidget(QtWidgets.QLabel("Felbontás:"), 0, 0)
         sh.addWidget(self.res_combo, 0, 1, 1, 2)
