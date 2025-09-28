@@ -13,7 +13,14 @@ from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from qasync import QEventLoop
 from aiohttp import ClientSession, WSMsgType
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCDataChannel,
+)
+from aiortc.exceptions import InvalidStateError
 
 from vati_screenshare import ScreenShareTrack, RESOLUTIONS
 
@@ -331,6 +338,24 @@ class Core(QtCore.QObject):
             finally:
                 self._waiting_for_answer_logged = False
 
+    def _clear_pending_answer(
+        self,
+        *,
+        exc: Optional[BaseException] = None,
+        result: Optional[bool] = True,
+        cancel: bool = False,
+    ) -> None:
+        fut = self._pending_answer
+        if fut and not fut.done():
+            if cancel:
+                fut.cancel()
+            elif exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+        self._pending_answer = None
+        self._waiting_for_answer_logged = False
+
     async def _create_and_send_offer(self) -> None:
         if not self.pc:
             raise RuntimeError("Nincs aktív PeerConnection az ajánlat küldéséhez.")
@@ -340,6 +365,14 @@ class Core(QtCore.QObject):
         await self._wait_for_pending_answer()
 
         async with self._offer_lock:
+            state = getattr(self.pc, "signalingState", None)
+            if state and state != "stable":
+                self._emit_log(
+                    f"Az ajánlat készítése kihagyva – a jelzési állapot nem stabil: {state}.",
+                    logging.WARNING,
+                )
+                return
+
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
             await wait_ice_complete(self.pc)
@@ -357,10 +390,7 @@ class Core(QtCore.QObject):
                     },
                 })
             except Exception as exc:
-                if not fut.done():
-                    fut.set_exception(exc)
-                self._pending_answer = None
-                self._waiting_for_answer_logged = False
+                self._clear_pending_answer(exc=exc)
                 raise
 
     async def _ws_loop(self):
@@ -381,21 +411,38 @@ class Core(QtCore.QObject):
                         "sdp":  self.pc.localDescription.sdp,
                     }})
                 elif op == "answer" and self.role == "sender":
+                    if not self.pc:
+                        continue
+
                     sdp = data["sdp"]
+                    state = self.pc.signalingState
+                    if state != "have-local-offer":
+                        self._emit_log(
+                            f"Váratlan answer érkezett a(z) {state} jelzési állapotban – figyelmen kívül hagyva.",
+                            logging.WARNING,
+                        )
+                        self._clear_pending_answer(result=False)
+                        continue
+
                     try:
                         await self.pc.setRemoteDescription(RTCSessionDescription(**sdp))
+                    except InvalidStateError as e:
+                        new_state = getattr(self.pc, "signalingState", "ismeretlen")
+                        self._emit_log(
+                            f"Távoli SDP beállítása érvénytelen állapotban (\"{new_state}\"): {e}",
+                            logging.WARNING,
+                        )
+                        if new_state == "stable":
+                            self._clear_pending_answer(result=True)
+                        else:
+                            self._clear_pending_answer(exc=e)
+                        continue
                     except Exception as e:
                         self._emit_log(f"Távoli SDP beállítása sikertelen: {e}", logging.ERROR)
-                        if self._pending_answer and not self._pending_answer.done():
-                            self._pending_answer.set_exception(e)
-                        self._pending_answer = None
-                        self._waiting_for_answer_logged = False
-                        break
-                    else:
-                        if self._pending_answer and not self._pending_answer.done():
-                            self._pending_answer.set_result(True)
-                        self._pending_answer = None
-                        self._waiting_for_answer_logged = False
+                        self._clear_pending_answer(exc=e)
+                        continue
+
+                    self._clear_pending_answer(result=True)
         except Exception as e:
             self._emit_log(f"WS loop ended: {e}", logging.ERROR)
 
@@ -526,10 +573,7 @@ class Core(QtCore.QObject):
         try:
             if self.pc: await self.pc.close()
         except: pass
-        if self._pending_answer and not self._pending_answer.done():
-            self._pending_answer.cancel()
-        self._pending_answer = None
-        self._waiting_for_answer_logged = False
+        self._clear_pending_answer(cancel=True)
         self.status.emit("Leállítva")
 
 class Main(QtWidgets.QMainWindow):
