@@ -435,6 +435,9 @@ class Main(QtWidgets.QMainWindow):
         root.addWidget(panel, 1)
 
         self.core: Optional[Core] = None
+
+        self._load_settings()
+
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_ping.clicked.connect(self.on_ping)
@@ -444,6 +447,12 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
+
+        self.role_combo.currentTextChanged.connect(lambda _: self._save_settings())
+        self.chk_relay.toggled.connect(lambda _: self._save_settings())
+        self.res_combo.currentIndexChanged.connect(lambda _: self._save_settings())
+        self.fps_slider.valueChanged.connect(lambda _: self._save_settings())
+        self.br_slider.valueChanged.connect(lambda _: self._save_settings())
 
     @QtCore.Slot()
     def on_start(self):
@@ -521,6 +530,45 @@ class Main(QtWidgets.QMainWindow):
                 scaled = pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
                 self.video_label.setPixmap(scaled)
         return super().resizeEvent(e)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._save_settings()
+        return super().closeEvent(event)
+
+    def _settings(self) -> QtCore.QSettings:
+        return QtCore.QSettings("VatiVision", "ProClient")
+
+    def _load_settings(self):
+        s = self._settings()
+
+        role = s.value("ui/role", "sender")
+        idx = self.role_combo.findText(role)
+        if idx >= 0:
+            self.role_combo.setCurrentIndex(idx)
+
+        prefer = s.value("ui/prefer_relay", False, type=bool)
+        self.chk_relay.setChecked(prefer)
+
+        res = s.value("ui/resolution", self.res_combo.currentText())
+        ridx = self.res_combo.findText(res)
+        if ridx >= 0:
+            self.res_combo.setCurrentIndex(ridx)
+
+        fps = int(s.value("ui/fps", self.fps_slider.value(), type=int))
+        self.fps_slider.setValue(fps)
+        self.fps_label.setText(f"FPS: {fps}")
+
+        br = int(s.value("ui/bitrate", self.br_slider.value(), type=int))
+        self.br_slider.setValue(br)
+        self.br_label.setText(f"Bitráta: {br} kbps")
+
+    def _save_settings(self):
+        s = self._settings()
+        s.setValue("ui/role", self.role_combo.currentText())
+        s.setValue("ui/prefer_relay", self.chk_relay.isChecked())
+        s.setValue("ui/resolution", self.res_combo.currentText())
+        s.setValue("ui/fps", self.fps_slider.value())
+        s.setValue("ui/bitrate", self.br_slider.value())
 
 def main():
     app = QtWidgets.QApplication([])
