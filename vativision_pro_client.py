@@ -119,6 +119,7 @@ ROOM_PIN     = "428913"
 STUN_URLS    = ["stun:stun.l.google.com:19302"]
 APP_TITLE    = "VatiVision Pro - UMKGL Solutions"
 APP_ICON_PATH = Path(__file__).resolve().parent / "program_logo.png"
+CURSOR_IMAGE_PATH = Path(__file__).resolve().parent / "cursor.png"
 
 BW_SECONDS   = 5.0
 BW_CHUNK     = 16 * 1024
@@ -219,6 +220,49 @@ class FullscreenViewer(QtWidgets.QWidget):
         self.label.setPixmap(scaled)
 
 
+class VideoSurface(QtWidgets.QLabel):
+    """Clickable video surface that emits normalized coordinates."""
+
+    clicked = QtCore.Signal(float, float)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self._pixmap_size = QtCore.QSize()
+
+    def setPixmap(self, pixmap: Optional[QtGui.QPixmap]) -> None:  # type: ignore[override]
+        super().setPixmap(pixmap)
+        if pixmap is None or pixmap.isNull():
+            self._pixmap_size = QtCore.QSize()
+        else:
+            self._pixmap_size = pixmap.size()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            self._emit_click(event.position())
+        super().mousePressEvent(event)
+
+    def _emit_click(self, pos: QtCore.QPointF) -> None:
+        pixmap = self.pixmap()
+        if not pixmap or pixmap.isNull():
+            return
+        pix_w = pixmap.width()
+        pix_h = pixmap.height()
+        if pix_w <= 0 or pix_h <= 0:
+            return
+        label_w = self.width()
+        label_h = self.height()
+        offset_x = max(0.0, (label_w - pix_w) / 2.0)
+        offset_y = max(0.0, (label_h - pix_h) / 2.0)
+        local_x = pos.x() - offset_x
+        local_y = pos.y() - offset_y
+        if local_x < 0 or local_y < 0 or local_x > pix_w or local_y > pix_h:
+            return
+        norm_x = float(local_x / pix_w)
+        norm_y = float(local_y / pix_h)
+        self.clicked.emit(norm_x, norm_y)
+
+
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
     ice_servers = [
         RTCIceServer(urls=STUN_URLS),
@@ -248,6 +292,7 @@ class Core(QtCore.QObject):
     log         = QtCore.Signal(str)
     msg_in      = QtCore.Signal(str)
     video_frame = QtCore.Signal(QtGui.QImage)
+    pointer     = QtCore.Signal(float, float, bool)
 
     def __init__(self, role: str, prefer_relay: bool):
         super().__init__()
@@ -279,6 +324,7 @@ class Core(QtCore.QObject):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._restart_lock = asyncio.Lock()
         self._ws_task: Optional[asyncio.Task] = None
+        self._pointer_hide_task: Optional[asyncio.Task] = None
 
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
@@ -369,6 +415,26 @@ class Core(QtCore.QObject):
                 return
             if m == "pong":
                 self.msg_in.emit("Pong visszaigazolás megérkezett ✅")
+                return
+            if m == "CURSOR_HIDE":
+                self._on_remote_pointer(0.0, 0.0, False)
+                return
+            if m.startswith("CURSOR"):
+                parts = m.split()
+                if len(parts) >= 3:
+                    try:
+                        norm_x = float(parts[1])
+                        norm_y = float(parts[2])
+                    except ValueError:
+                        self._emit_log(f"Érvénytelen kurzor üzenet: {m}", logging.DEBUG)
+                        return
+                    visible = True
+                    if len(parts) >= 4:
+                        flag = parts[3].lower()
+                        visible = flag not in {"0", "false", "off"}
+                    self._on_remote_pointer(norm_x, norm_y, visible)
+                else:
+                    self._emit_log(f"Hiányos kurzor üzenet: {m}", logging.DEBUG)
                 return
             if m.startswith("BW_BEGIN"):
                 self._bw_recv_active = True
@@ -631,6 +697,8 @@ class Core(QtCore.QObject):
 
         self.channel = None
         self._clear_pending_answer(cancel=True)
+        self._cancel_pointer_hide()
+        self.pointer.emit(0.0, 0.0, False)
 
         ws_task = self._ws_task
         self._ws_task = None
@@ -678,6 +746,32 @@ class Core(QtCore.QObject):
             mbps = (sent_bytes * 8) / 1_000_000 / elapsed
             self._emit_log(f"[bw] sender-est {mbps:.2f} Mb/s")
         finally: self._bw_report_fut = None
+
+    async def send_pointer(self, norm_x: float, norm_y: float) -> None:
+        if not self.channel or self.channel.readyState != "open":
+            self._emit_log("Kurzor pozíció nem küldhető: a DataChannel zárva.", logging.WARNING)
+            return
+        try:
+            nx = float(norm_x)
+            ny = float(norm_y)
+        except (TypeError, ValueError):
+            self._emit_log("Kurzor pozíció érvénytelen.", logging.DEBUG)
+            return
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        message = f"CURSOR {nx:.4f} {ny:.4f}"
+        try:
+            self.channel.send(message)
+        except Exception as exc:
+            self._emit_log(f"Kurzor pozíció küldési hiba: {exc}", logging.WARNING)
+
+    async def send_pointer_hide(self) -> None:
+        if not self.channel or self.channel.readyState != "open":
+            return
+        try:
+            self.channel.send("CURSOR_HIDE")
+        except Exception as exc:
+            self._emit_log(f"Kurzor elrejtési üzenet küldési hiba: {exc}", logging.DEBUG)
 
     async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
         if not self.pc:
@@ -736,6 +830,7 @@ class Core(QtCore.QObject):
         if not for_reconnect:
             self._share_resume_params = None
         self._emit_log("[media] Képernyőmegosztás leállítva.")
+        self._cancel_pointer_hide()
 
     async def set_resolution(self, width: int, height: int):
         if self._share_track:
@@ -797,6 +892,43 @@ class Core(QtCore.QObject):
                 pass
         await self._cleanup_connection(for_reconnect=False)
         self.status.emit("Leállítva")
+
+    def _on_remote_pointer(self, norm_x: float, norm_y: float, visible: bool) -> None:
+        nx = max(0.0, min(1.0, float(norm_x)))
+        ny = max(0.0, min(1.0, float(norm_y)))
+        if self._share_track:
+            if visible:
+                self._share_track.set_remote_pointer(nx, ny)
+            else:
+                self._share_track.clear_remote_pointer()
+        self.pointer.emit(nx, ny, visible)
+        if visible:
+            self._schedule_pointer_hide()
+        else:
+            self._cancel_pointer_hide()
+
+    def _schedule_pointer_hide(self, delay: float = 3.0) -> None:
+        loop = asyncio.get_running_loop()
+        task = self._pointer_hide_task
+        if task and not task.done():
+            task.cancel()
+        self._pointer_hide_task = loop.create_task(self._hide_pointer_after(delay))
+
+    def _cancel_pointer_hide(self) -> None:
+        task = self._pointer_hide_task
+        if task and not task.done():
+            task.cancel()
+        self._pointer_hide_task = None
+
+    async def _hide_pointer_after(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        self._pointer_hide_task = None
+        if self._share_track:
+            self._share_track.clear_remote_pointer()
+        self.pointer.emit(0.0, 0.0, False)
 
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
@@ -912,13 +1044,17 @@ class Main(QtWidgets.QMainWindow):
         vc_layout.setContentsMargins(0, 0, 0, 0)
         vc_layout.setSpacing(6)
 
-        self.video_label = QtWidgets.QLabel("Nincs bejövő videó")
-        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.video_label = VideoSurface("Nincs bejövő videó")
         self.video_label.setMinimumHeight(280)
         self.video_label.setStyleSheet(
             "QLabel { background-color: #1e1f22; border: 1px solid #3a3c41; border-radius: 8px; }"
         )
+        self.video_label.clicked.connect(self.on_video_clicked)
         vc_layout.addWidget(self.video_label, 1)
+
+        self.pointer_overlay = QtWidgets.QLabel(self.video_label)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.pointer_overlay.hide()
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.addStretch(1)
@@ -969,6 +1105,17 @@ class Main(QtWidgets.QMainWindow):
         self._update_role_ui(self.role_combo.currentData() or "sender")
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
+        if CURSOR_IMAGE_PATH.exists():
+            self._cursor_pixmap = QtGui.QPixmap(str(CURSOR_IMAGE_PATH))
+        else:
+            self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_scaled: Optional[QtGui.QPixmap] = None
+        self._cursor_scaled_width: int = 0
+        self._pointer_timer = QtCore.QTimer(self)
+        self._pointer_timer.setSingleShot(True)
+        self._pointer_timer.timeout.connect(self.on_pointer_timeout)
+        self._pointer_norm: Optional[Tuple[float, float]] = None
+        self._pointer_local = False
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -1008,6 +1155,7 @@ class Main(QtWidgets.QMainWindow):
         self.core.log.connect(self.append_log_message)
         self.core.msg_in.connect(self.inbox.appendPlainText)
         self.core.video_frame.connect(self.update_video)
+        self.core.pointer.connect(self.on_pointer_update)
 
         async def _run():
             try: await self.core.start()
@@ -1020,6 +1168,8 @@ class Main(QtWidgets.QMainWindow):
         if not self.core: return
         core = self.core; self.core = None
         self.log_ui_message("Kapcsolat leállítása kezdeményezve.")
+        self._pointer_timer.stop()
+        self.hide_pointer_overlay()
         asyncio.create_task(core.stop())
 
     @QtCore.Slot()
@@ -1094,6 +1244,7 @@ class Main(QtWidgets.QMainWindow):
             QtCore.Qt.SmoothTransformation,
         )
         self.video_label.setPixmap(scaled)
+        self._reposition_pointer_overlay()
 
     def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
         if self._last_pixmap:
@@ -1103,7 +1254,92 @@ class Main(QtWidgets.QMainWindow):
                 QtCore.Qt.SmoothTransformation,
             )
             self.video_label.setPixmap(scaled)
+        self._reposition_pointer_overlay()
         return super().resizeEvent(e)
+
+    def _prepare_cursor_pixmap(self) -> Optional[QtGui.QPixmap]:
+        if self._cursor_pixmap.isNull():
+            return None
+        pixmap = self.video_label.pixmap()
+        if not pixmap or pixmap.isNull():
+            return None
+        target_width = max(24, int(pixmap.width() * 0.05))
+        target_width = min(target_width, self._cursor_pixmap.width())
+        if target_width <= 0:
+            return None
+        if self._cursor_scaled is None or self._cursor_scaled_width != target_width:
+            self._cursor_scaled = self._cursor_pixmap.scaledToWidth(
+                target_width, QtCore.Qt.SmoothTransformation
+            )
+            self._cursor_scaled_width = self._cursor_scaled.width()
+        return self._cursor_scaled
+
+    def _show_pointer_overlay(self, norm_x: float, norm_y: float, *, local: bool) -> None:
+        pix = self._prepare_cursor_pixmap()
+        if pix is None:
+            return
+        nx = max(0.0, min(1.0, float(norm_x)))
+        ny = max(0.0, min(1.0, float(norm_y)))
+        self.pointer_overlay.setPixmap(pix)
+        self.pointer_overlay.resize(pix.size())
+        self._pointer_norm = (nx, ny)
+        self._pointer_local = local
+        self.pointer_overlay.show()
+        self._reposition_pointer_overlay()
+        self._pointer_timer.start(2500)
+
+    def _reposition_pointer_overlay(self) -> None:
+        if self._pointer_norm is None or not self.pointer_overlay.isVisible():
+            return
+        pixmap = self.video_label.pixmap()
+        if not pixmap or pixmap.isNull():
+            self.hide_pointer_overlay()
+            return
+        lw, lh = self.video_label.width(), self.video_label.height()
+        pw, ph = pixmap.width(), pixmap.height()
+        if pw <= 0 or ph <= 0:
+            return
+        offset_x = max(0, (lw - pw) // 2)
+        offset_y = max(0, (lh - ph) // 2)
+        nx, ny = self._pointer_norm
+        x = offset_x + int(round(nx * pw))
+        y = offset_y + int(round(ny * ph))
+        ow = self.pointer_overlay.width()
+        oh = self.pointer_overlay.height()
+        x = max(0, min(x, lw - ow))
+        y = max(0, min(y, lh - oh))
+        self.pointer_overlay.move(x, y)
+
+    def hide_pointer_overlay(self) -> None:
+        self._pointer_timer.stop()
+        self._pointer_norm = None
+        self._pointer_local = False
+        self.pointer_overlay.hide()
+
+    @QtCore.Slot(float, float, bool)
+    def on_pointer_update(self, norm_x: float, norm_y: float, visible: bool) -> None:
+        if visible:
+            self._show_pointer_overlay(norm_x, norm_y, local=False)
+        else:
+            self.hide_pointer_overlay()
+
+    @QtCore.Slot(float, float)
+    def on_video_clicked(self, norm_x: float, norm_y: float) -> None:
+        if not self.core or self.core.role != "receiver":
+            return
+        pixmap = self.video_label.pixmap()
+        if not pixmap or pixmap.isNull():
+            return
+        self._show_pointer_overlay(norm_x, norm_y, local=True)
+        self.log_ui_message("Kurzor mutatása elküldve a küldőnek.")
+        asyncio.create_task(self.core.send_pointer(norm_x, norm_y))
+
+    @QtCore.Slot()
+    def on_pointer_timeout(self) -> None:
+        was_local = self._pointer_local
+        self.hide_pointer_overlay()
+        if was_local and self.core and self.core.role == "receiver":
+            asyncio.create_task(self.core.send_pointer_hide())
 
     def changeEvent(self, event: QtCore.QEvent) -> None:
         if event.type() == QtCore.QEvent.WindowStateChange and self._tray_icon and self._tray_icon.isVisible():

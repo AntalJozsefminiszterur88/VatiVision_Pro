@@ -1,8 +1,10 @@
 import asyncio
 import concurrent.futures
 import logging
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -52,7 +54,29 @@ class ScreenShareTrack(VideoStreamTrack):
         self._capture_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="vati-screenshare"
         )
+        self._cursor_image = None
+        self._cursor_cache = None
+        self._cursor_cache_size: Optional[Tuple[int, int]] = None
+        self._pointer_visible = False
+        self._pointer_norm: Tuple[float, float] = (0.0, 0.0)
+        self._pointer_lock = threading.Lock()
+
+        self._load_cursor()
         self._init_capture()
+
+    def _load_cursor(self) -> None:
+        cursor_path = Path(__file__).resolve().parent / "cursor.png"
+        if not cursor_path.exists():
+            logger.warning("A kurzor ikon (%s) nem található.", cursor_path)
+            return
+        try:
+            self._cursor_image = Image.open(cursor_path).convert("RGBA")
+        except Exception as exc:
+            logger.exception("Nem sikerült betölteni a kurzor ikont: %s", exc)
+            self._cursor_image = None
+            return
+        self._cursor_cache = None
+        self._cursor_cache_size = None
 
     def set_size(self, width: int, height: int):
         self._size = (int(width), int(height))
@@ -137,7 +161,53 @@ class ScreenShareTrack(VideoStreamTrack):
         img = Image.frombytes("RGB", raw.size, raw.rgb)
         if self._size and raw.size != self._size:
             img = img.resize(self._size, Image.LANCZOS)
+        img = self._apply_pointer_overlay(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         return VideoFrame.from_image(img)
+
+    def _get_cursor_for_size(self, frame_size: Tuple[int, int]):
+        if not self._cursor_image:
+            return None
+        width, height = frame_size
+        if width <= 0 or height <= 0:
+            return None
+        base = self._cursor_image
+        target_width = min(base.width, max(24, int(width * 0.05)))
+        aspect = base.width / base.height if base.height else 1.0
+        target_height = min(base.height, max(24, int(target_width / aspect)))
+        size = (target_width, target_height)
+        if self._cursor_cache is None or self._cursor_cache_size != size:
+            self._cursor_cache = base.resize(size, Image.LANCZOS)
+            self._cursor_cache_size = size
+        return self._cursor_cache
+
+    def _apply_pointer_overlay(self, img: Image.Image) -> Image.Image:
+        cursor = self._get_cursor_for_size(img.size)
+        if cursor is None:
+            return img
+        with self._pointer_lock:
+            if not self._pointer_visible:
+                return img
+            norm_x, norm_y = self._pointer_norm
+        width, height = img.size
+        cw, ch = cursor.size
+        x = int(round(norm_x * width))
+        y = int(round(norm_y * height))
+        x = max(0, min(x, max(0, width - cw)))
+        y = max(0, min(y, max(0, height - ch)))
+        base = img.convert("RGBA")
+        base.paste(cursor, (x, y), cursor)
+        return base
+
+    def set_remote_pointer(self, norm_x: float, norm_y: float) -> None:
+        with self._pointer_lock:
+            self._pointer_visible = True
+            self._pointer_norm = (float(max(0.0, min(1.0, norm_x))), float(max(0.0, min(1.0, norm_y))))
+
+    def clear_remote_pointer(self) -> None:
+        with self._pointer_lock:
+            self._pointer_visible = False
 
     async def recv(self) -> VideoFrame:
         fps = max(1, int(self._fps))
@@ -174,6 +244,7 @@ class ScreenShareTrack(VideoStreamTrack):
             finally:
                 self._capture_executor = None
                 await loop.run_in_executor(None, executor.shutdown, True)
+        self.clear_remote_pointer()
 
     def _close_capture_resources(self) -> None:
         if self._sct:
