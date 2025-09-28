@@ -518,6 +518,8 @@ class Main(QtWidgets.QMainWindow):
 
         root.addWidget(panel, 1)
 
+        self.settings = QtCore.QSettings("UMKGL Solutions", "VatiVision_Pro")
+
         self.core: Optional[Core] = None
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
@@ -528,6 +530,18 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
+
+        self.role_combo.currentTextChanged.connect(
+            lambda value: self._save_setting("ui/role", value)
+        )
+        self.chk_relay.toggled.connect(
+            lambda checked: self._save_setting("ui/prefer_relay", checked)
+        )
+        self.res_combo.currentTextChanged.connect(
+            lambda value: self._save_setting("ui/resolution", value)
+        )
+
+        self._restore_settings()
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -602,6 +616,7 @@ class Main(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def on_fps_changed(self, val: int):
         self.fps_label.setText(f"FPS: {val}")
+        self._save_setting("ui/fps", val)
         if self.core:
             self.log_ui_message(f"FPS módosítása: {val}")
             asyncio.create_task(self.core.set_fps(val))
@@ -609,6 +624,7 @@ class Main(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def on_br_changed(self, val: int):
         self.br_label.setText(f"Bitráta: {val} kbps")
+        self._save_setting("ui/bitrate", val)
         if self.core:
             self.log_ui_message(f"Bitráta módosítása: {val} kbps")
             asyncio.create_task(self.core.set_bitrate(val))
@@ -627,6 +643,62 @@ class Main(QtWidgets.QMainWindow):
                 scaled = pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
                 self.video_label.setPixmap(scaled)
         return super().resizeEvent(e)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._save_setting("window/geometry", self.saveGeometry())
+        self.settings.sync()
+        super().closeEvent(event)
+
+    def _restore_settings(self) -> None:
+        geometry = self.settings.value("window/geometry")
+        if isinstance(geometry, (QtCore.QByteArray, bytes)) and geometry:
+            self.restoreGeometry(QtCore.QByteArray(geometry))
+
+        role = self.settings.value("ui/role", "sender")
+        idx = self.role_combo.findText(str(role))
+        if idx >= 0:
+            self.role_combo.setCurrentIndex(idx)
+
+        prefer = self.settings.value("ui/prefer_relay", False)
+        self.chk_relay.setChecked(self._to_bool(prefer))
+
+        res = self.settings.value("ui/resolution")
+        if res:
+            r_idx = self.res_combo.findText(str(res))
+            if r_idx >= 0:
+                self.res_combo.setCurrentIndex(r_idx)
+
+        fps = self._to_int(
+            self.settings.value("ui/fps", self.fps_slider.value()),
+            fallback=self.fps_slider.value(),
+        )
+        self.fps_slider.setValue(fps)
+
+        bitrate = self._to_int(
+            self.settings.value("ui/bitrate", self.br_slider.value()),
+            fallback=self.br_slider.value(),
+        )
+        self.br_slider.setValue(bitrate)
+
+    def _save_setting(self, key: str, value) -> None:
+        self.settings.setValue(key, value)
+
+    @staticmethod
+    def _to_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "t", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _to_int(value, fallback: Optional[int] = None) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            if fallback is not None:
+                return fallback
+            raise
 
 def main():
     app = QtWidgets.QApplication([])
