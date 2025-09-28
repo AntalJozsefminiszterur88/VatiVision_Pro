@@ -797,11 +797,6 @@ class Main(QtWidgets.QMainWindow):
         )
         self.btn_fullscreen.clicked.connect(self.on_toggle_fullscreen)
 
-        self._restore_settings()
-        self._update_role_ui(self.role_combo.currentData() or "sender")
-        self.fullscreen_window: Optional[FullscreenViewer] = None
-        self._last_pixmap: Optional[QtGui.QPixmap] = None
-
         self._tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
         self._tray_message_shown = False
         self._allow_close = False
@@ -809,6 +804,11 @@ class Main(QtWidgets.QMainWindow):
             self._create_tray_icon()
         else:
             self.log_ui_message("A rendszer nem támogatja a tálca ikont, kilépéskor az alkalmazás bezárul.", logging.INFO)
+
+        self._restore_settings()
+        self._update_role_ui(self.role_combo.currentData() or "sender")
+        self.fullscreen_window: Optional[FullscreenViewer] = None
+        self._last_pixmap: Optional[QtGui.QPixmap] = None
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
