@@ -167,6 +167,58 @@ class AnimatedButton(QtWidgets.QPushButton):
         self._animate_strength(0.0, 180)
 
 
+class FullscreenViewer(QtWidgets.QWidget):
+    """Window that displays the shared video feed in fullscreen."""
+
+    closed = QtCore.Signal()
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent, QtCore.Qt.Window)
+        self.setWindowTitle("VatiVision Pro — Teljes képernyő")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
+
+        self._pixmap: Optional[QtGui.QPixmap] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QtWidgets.QLabel()
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        self.label.setStyleSheet("background-color: black;")
+        layout.addWidget(self.label, 1)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self._update_scaled_pixmap()
+        super().resizeEvent(event)
+
+    def update_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._pixmap = pixmap
+        self._update_scaled_pixmap()
+
+    def _update_scaled_pixmap(self) -> None:
+        if not self._pixmap:
+            self.label.clear()
+            return
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        scaled = self._pixmap.scaled(
+            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
+        self.label.setPixmap(scaled)
+
+
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
     ice_servers = [
         RTCIceServer(urls=STUN_URLS),
@@ -662,11 +714,27 @@ class Main(QtWidgets.QMainWindow):
 
         preview_box = QtWidgets.QGroupBox("Bejövő videó (fogadó)")
         pv = QtWidgets.QVBoxLayout(preview_box)
+
+        video_container = QtWidgets.QWidget()
+        vc_layout = QtWidgets.QVBoxLayout(video_container)
+        vc_layout.setContentsMargins(0, 0, 0, 0)
+        vc_layout.setSpacing(6)
+
         self.video_label = QtWidgets.QLabel("Nincs bejövő videó")
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
         self.video_label.setMinimumHeight(280)
-        self.video_label.setStyleSheet("QLabel { background-color: #1e1f22; border: 1px solid #3a3c41; border-radius: 8px; }")
-        pv.addWidget(self.video_label)
+        self.video_label.setStyleSheet(
+            "QLabel { background-color: #1e1f22; border: 1px solid #3a3c41; border-radius: 8px; }"
+        )
+        vc_layout.addWidget(self.video_label, 1)
+
+        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.addStretch(1)
+        self.btn_fullscreen = AnimatedButton("Teljes képernyő")
+        controls_row.addWidget(self.btn_fullscreen)
+        vc_layout.addLayout(controls_row)
+
+        pv.addWidget(video_container)
         v.addWidget(preview_box, 1)
 
         self.inbox = QtWidgets.QPlainTextEdit(); self.inbox.setReadOnly(True)
@@ -695,9 +763,12 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentTextChanged.connect(
             lambda value: self._save_setting("ui/resolution", value)
         )
+        self.btn_fullscreen.clicked.connect(self.on_toggle_fullscreen)
 
         self._restore_settings()
         self._update_role_ui(self.role_combo.currentData() or "sender")
+        self.fullscreen_window: Optional[FullscreenViewer] = None
+        self._last_pixmap: Optional[QtGui.QPixmap] = None
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -798,21 +869,53 @@ class Main(QtWidgets.QMainWindow):
     def update_video(self, img: QtGui.QImage):
         if img.isNull(): return
         pix = QtGui.QPixmap.fromImage(img)
-        scaled = pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        self._last_pixmap = pix
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.update_pixmap(pix)
+        scaled = pix.scaled(
+            self.video_label.size(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
         self.video_label.setPixmap(scaled)
 
     def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
-        if self.video_label.pixmap() is not None:
-            pix = self.video_label.pixmap()
-            if pix:
-                scaled = pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-                self.video_label.setPixmap(scaled)
+        if self._last_pixmap:
+            scaled = self._last_pixmap.scaled(
+                self.video_label.size(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+            self.video_label.setPixmap(scaled)
         return super().resizeEvent(e)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.fullscreen_window.close()
         self._save_setting("window/geometry", self.saveGeometry())
         self.settings.sync()
         super().closeEvent(event)
+
+    @QtCore.Slot()
+    def on_toggle_fullscreen(self) -> None:
+        if self.fullscreen_window is None:
+            self.fullscreen_window = FullscreenViewer(self)
+            self.fullscreen_window.closed.connect(self.on_fullscreen_closed)
+
+        if self.fullscreen_window.isVisible():
+            self.fullscreen_window.close()
+            self.btn_fullscreen.setText("Teljes képernyő")
+            return
+
+        if self._last_pixmap:
+            self.fullscreen_window.update_pixmap(self._last_pixmap)
+        self.fullscreen_window.showFullScreen()
+        self.fullscreen_window.activateWindow()
+        self.btn_fullscreen.setText("Kilépés a teljes képernyőből")
+
+    @QtCore.Slot()
+    def on_fullscreen_closed(self) -> None:
+        self.btn_fullscreen.setText("Teljes képernyő")
 
     def _restore_settings(self) -> None:
         geometry = self.settings.value("window/geometry")
