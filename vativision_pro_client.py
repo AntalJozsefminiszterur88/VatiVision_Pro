@@ -378,7 +378,9 @@ class Main(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(panel)
 
         row = QtWidgets.QHBoxLayout()
-        self.role_combo = QtWidgets.QComboBox(); self.role_combo.addItems(["sender","receiver"])
+        self.role_combo = QtWidgets.QComboBox()
+        self.role_combo.addItem("Küldő", userData="sender")
+        self.role_combo.addItem("Fogadó", userData="receiver")
         row.addWidget(QtWidgets.QLabel("Szerep:")); row.addWidget(self.role_combo); row.addStretch(1)
         v.addLayout(row)
 
@@ -448,7 +450,8 @@ class Main(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def on_start(self):
         if self.core: return
-        role = self.role_combo.currentText(); prefer = self.chk_relay.isChecked()
+        role = self.role_combo.currentData() or self.role_combo.currentText()
+        prefer = self.chk_relay.isChecked()
         self.core = Core(role=role, prefer_relay=prefer)
         self.core.status.connect(self.status.setText)
         self.core.log.connect(self.log.appendPlainText)
