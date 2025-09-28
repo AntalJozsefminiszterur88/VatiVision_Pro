@@ -3,6 +3,7 @@
 import asyncio, json
 from time import perf_counter
 from typing import Optional
+from pathlib import Path
 
 from PySide6 import QtWidgets, QtCore, QtGui
 from qasync import QEventLoop
@@ -17,6 +18,7 @@ ROOM_NAME    = "VATI-ROOM"
 ROOM_PIN     = "428913"
 STUN_URLS    = ["stun:stun.l.google.com:19302"]
 APP_TITLE    = "VatiVision Pro — Kliens (Ping + TURN + Sávszél + Képernyő)"
+APP_ICON_PATH = Path(__file__).resolve().parent / "program_logo.png"
 
 BW_SECONDS   = 5.0
 BW_CHUNK     = 16 * 1024
@@ -343,6 +345,9 @@ class Main(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1200, 720)
+        if APP_ICON_PATH.exists():
+            icon = QtGui.QIcon(str(APP_ICON_PATH))
+            self.setWindowIcon(icon)
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         root = QtWidgets.QHBoxLayout(central); root.setContentsMargins(12,12,12,12); root.setSpacing(12)
@@ -520,6 +525,8 @@ class Main(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication([])
     app.setStyleSheet(style())
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
     loop = QEventLoop(app); asyncio.set_event_loop(loop)
     w = Main(); w.show()
     with loop:
