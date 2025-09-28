@@ -2,6 +2,9 @@
 # VatiVision Pro — Client (Discord-style UI) — fixed import name
 import asyncio, json
 import logging
+import os
+import sys
+import ctypes
 from logging.handlers import RotatingFileHandler
 from time import perf_counter
 from typing import Optional
@@ -14,7 +17,52 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, R
 
 from vati_screenshare import ScreenShareTrack, RESOLUTIONS
 
-LOG_ROOT = Path.home() / "felhasználó" / "dokumentumok" / "UMKGL Solutions" / "VatiVision_Pro"
+def _resolve_documents_dir() -> Path:
+    """Return the user's documents directory in a locale agnostic way."""
+
+    override = os.getenv("VATIVISION_LOG_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    if sys.platform.startswith("win"):
+        try:
+            from ctypes import wintypes
+
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            SHGFP_TYPE_CURRENT = 0
+            CSIDL_PERSONAL = 5  # Documents folder
+            if (
+                ctypes.windll.shell32.SHGetFolderPathW(
+                    None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf
+                )
+                == 0
+            ):
+                documents_dir = Path(buf.value)
+                if documents_dir:
+                    return documents_dir
+        except Exception:  # pragma: no cover - best effort on Windows only
+            logging.getLogger(__name__).debug(
+                "Nem sikerült lekérdezni a Dokumentumok mappát a Windows API-ból.",
+                exc_info=True,
+            )
+
+    home = Path.home()
+    candidates = [
+        home / "Documents",
+        home / "Dokumentumok",
+        home / "dokumentumok",
+        home / "OneDrive" / "Documents",
+        home / "OneDrive" / "Dokumentumok",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return home / "Documents"
+
+
+LOG_ROOT = _resolve_documents_dir() / "UMKGL Solutions" / "VatiVision_Pro"
 
 
 def _setup_file_logging() -> Path:
