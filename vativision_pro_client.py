@@ -10,6 +10,8 @@ from time import perf_counter
 from typing import Optional, Tuple
 from pathlib import Path
 
+import numpy as np
+
 from PySide6 import QtWidgets, QtCore, QtGui
 from qasync import QEventLoop
 from aiohttp import ClientSession, WSMsgType
@@ -23,6 +25,11 @@ from aiortc import (
 from aiortc.exceptions import InvalidStateError
 
 from vati_screenshare import ScreenShareTrack, RESOLUTIONS
+from vati_audio import (
+    AudioPlaybackEngine,
+    SystemAudioTrack,
+    exclude_discord_from_loopback,
+)
 
 def _resolve_documents_dir() -> Path:
     """Return the user's documents directory in a locale agnostic way."""
@@ -388,6 +395,7 @@ class Core(QtCore.QObject):
     msg_in      = QtCore.Signal(str)
     video_frame = QtCore.Signal(QtGui.QImage)
     pointer     = QtCore.Signal(float, float, bool)
+    audio_samples = QtCore.Signal(bytes, int, int)
 
     def __init__(self, role: str, prefer_relay: bool):
         super().__init__()
@@ -407,9 +415,12 @@ class Core(QtCore.QObject):
         self._bw_report_fut: Optional[asyncio.Future] = None
 
         self._share_track: Optional[ScreenShareTrack] = None
+        self._audio_track: Optional[SystemAudioTrack] = None
         self._video_sender = None
+        self._audio_sender = None
         self._target_bitrate_bps: Optional[int] = None
-        self._share_resume_params: Optional[Tuple[int, int, int, int]] = None
+        self._share_resume_params: Optional[Tuple[int, int, int, int, bool]] = None
+        self._share_audio_requested = False
 
         self._pending_answer: Optional[asyncio.Future] = None
         self._offer_lock = asyncio.Lock()
@@ -460,6 +471,8 @@ class Core(QtCore.QObject):
         def _on_track(track):
             if track.kind == "video":
                 asyncio.create_task(self._consume_video(track))
+            elif track.kind == "audio":
+                asyncio.create_task(self._consume_audio(track))
 
         if self.role == "sender":
             self.channel = self.pc.createDataChannel("chat")
@@ -497,6 +510,37 @@ class Core(QtCore.QObject):
                 self.video_frame.emit(qimg)
         except Exception as e:
             self._emit_log(f"[media] video consumer ended: {e}", logging.ERROR)
+
+    async def _consume_audio(self, track) -> None:
+        try:
+            while True:
+                frame = await track.recv()
+                try:
+                    data = frame.to_ndarray()
+                except Exception as exc:
+                    self._emit_log(f"[media] Hang frame konvertálási hiba: {exc}", logging.WARNING)
+                    continue
+                array = np.array(data)
+                if array.ndim == 1:
+                    array = array.reshape(1, -1)
+                if array.dtype == np.int16:
+                    array = array.astype(np.float32) / 32768.0
+                elif array.dtype == np.int32:
+                    array = array.astype(np.float32) / 2147483648.0
+                else:
+                    array = array.astype(np.float32)
+                channels = getattr(frame.layout, "channels", None) or array.shape[0]
+                if array.shape[0] == channels:
+                    array = array.T
+                else:
+                    array = array.reshape(-1, channels)
+                payload = array.astype(np.float32, copy=False).tobytes()
+                sample_rate = int(getattr(frame, "sample_rate", 48000) or 48000)
+                self.audio_samples.emit(payload, sample_rate, int(channels))
+        except Exception as e:
+            self._emit_log(f"[media] audio consumer ended: {e}", logging.INFO)
+        finally:
+            self.audio_samples.emit(b"", 0, 0)
 
     def _handle_message(self, m):
         if isinstance(m, str):
@@ -750,10 +794,10 @@ class Core(QtCore.QObject):
             self._emit_log("Kapcsolat helyreállt.")
             self.status.emit("Kapcsolat helyreállt ✅")
             if self._share_resume_params:
-                width, height, fps, kbps = self._share_resume_params
+                width, height, fps, kbps, audio = self._share_resume_params
                 self._emit_log("[media] Képernyőmegosztás automatikus újraindítása.")
                 try:
-                    await self.start_share(width, height, fps, kbps)
+                    await self.start_share(width, height, fps, kbps, audio)
                 except Exception as e:
                     self._emit_log(
                         f"[media] Automatikus képernyőmegosztás indítása sikertelen: {e}",
@@ -868,7 +912,9 @@ class Core(QtCore.QObject):
         except Exception as exc:
             self._emit_log(f"Kurzor elrejtési üzenet küldési hiba: {exc}", logging.DEBUG)
 
-    async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
+    async def start_share(
+        self, width: int, height: int, fps: int, bitrate_kbps: int, share_audio: bool
+    ):
         if not self.pc:
             self._emit_log("Nincs aktív PeerConnection.", logging.WARNING)
             return
@@ -878,6 +924,29 @@ class Core(QtCore.QObject):
 
         self._share_track = ScreenShareTrack(width=width, height=height, fps=fps)
         self._video_sender = self.pc.addTrack(self._share_track)
+
+        self._share_audio_requested = bool(share_audio)
+        if share_audio:
+            try:
+                if exclude_discord_from_loopback():
+                    self._emit_log("[media] Discord hang kizárva a rendszerhang felvételből.")
+            except Exception as exc:
+                self._emit_log(
+                    f"[media] Nem sikerült automatikusan kizárni a Discord hangját: {exc}",
+                    logging.WARNING,
+                )
+            try:
+                self._audio_track = SystemAudioTrack()
+                self._audio_sender = self.pc.addTrack(self._audio_track)
+                self._emit_log("[media] Hang megosztás elindítva.")
+            except Exception as exc:
+                self._emit_log(
+                    f"[media] Hang megosztás indítása sikertelen: {exc}",
+                    logging.ERROR,
+                )
+                self._audio_track = None
+                self._audio_sender = None
+                self._share_audio_requested = False
 
         self._target_bitrate_bps = max(50_000, int(bitrate_kbps) * 1000)
         try:
@@ -898,7 +967,7 @@ class Core(QtCore.QObject):
         except Exception as e:
             self._emit_log(f"[media] setParameters hiba (indítás): {e}", logging.ERROR)
 
-        params_snapshot = (width, height, fps, bitrate_kbps)
+        params_snapshot = (width, height, fps, bitrate_kbps, self._share_audio_requested)
         await self._create_and_send_offer()
         self._share_resume_params = params_snapshot
         self._emit_log("[media] Képernyőmegosztás elindítva.")
@@ -911,12 +980,26 @@ class Core(QtCore.QObject):
                 except Exception:
                     pass
             self._video_sender = None
+        if self._audio_sender:
+            if self.pc:
+                try:
+                    self.pc.removeTrack(self._audio_sender)
+                except Exception:
+                    pass
+            self._audio_sender = None
         if self._share_track:
             try:
                 await self._share_track.stop()
             except Exception:
                 pass
             self._share_track = None
+        if self._audio_track:
+            try:
+                await self._audio_track.stop()
+            except Exception:
+                pass
+            self._audio_track = None
+            self.audio_samples.emit(b"", 0, 0)
         if renegotiate and self.pc:
             try:
                 await self._create_and_send_offer()
@@ -924,6 +1007,7 @@ class Core(QtCore.QObject):
                 self._emit_log(f"[media] renegotiation hiba (stop_share): {e}", logging.ERROR)
         if not for_reconnect:
             self._share_resume_params = None
+            self._share_audio_requested = False
         self._emit_log("[media] Képernyőmegosztás leállítva.")
         self._cancel_pointer_hide()
 
@@ -932,8 +1016,8 @@ class Core(QtCore.QObject):
             self._share_track.set_size(width, height)
             self._emit_log(f"[media] Új felbontás: {width}×{height}")
         if self._share_resume_params:
-            _, _, fps, kbps = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            _, _, fps, kbps, audio = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps, audio)
 
     async def set_fps(self, fps: int):
         if self._share_track:
@@ -954,8 +1038,8 @@ class Core(QtCore.QObject):
                 self._emit_log(f"[media] setParameters (fps) hiba: {e}", logging.ERROR)
         self._emit_log(f"[media] Új FPS: {fps}")
         if self._share_resume_params:
-            width, height, _, kbps = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            width, height, _, kbps, audio = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps, audio)
 
     async def set_bitrate(self, kbps: int):
         self._target_bitrate_bps = max(50_000, int(kbps) * 1000)
@@ -974,8 +1058,8 @@ class Core(QtCore.QObject):
             except Exception as e:
                 self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
         if self._share_resume_params:
-            width, height, fps, _ = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            width, height, fps, _, audio = self._share_resume_params
+            self._share_resume_params = (width, height, fps, kbps, audio)
 
     async def stop(self):
         self._stopping = True
@@ -1038,6 +1122,7 @@ class Main(QtWidgets.QMainWindow):
         self.setWindowIcon(self._app_icon)
 
         self.ui_logger = logging.getLogger(f"{__name__}.UI")
+        self.audio_engine = AudioPlaybackEngine()
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
@@ -1127,8 +1212,10 @@ class Main(QtWidgets.QMainWindow):
         sh.addWidget(self.fps_slider, 1, 1, 1, 2)
         sh.addWidget(self.br_label, 2, 0)
         sh.addWidget(self.br_slider, 2, 1, 1, 2)
-        sh.addWidget(self.btn_share_start, 3, 1)
-        sh.addWidget(self.btn_share_stop, 3, 2)
+        self.chk_share_audio = QtWidgets.QCheckBox("Hang megosztása (Discord hang nélkül)")
+        sh.addWidget(self.chk_share_audio, 3, 0, 1, 3)
+        sh.addWidget(self.btn_share_start, 4, 1)
+        sh.addWidget(self.btn_share_stop, 4, 2)
         v.addWidget(share)
 
         preview_box = QtWidgets.QGroupBox("Bejövő videó (fogadó)")
@@ -1150,6 +1237,18 @@ class Main(QtWidgets.QMainWindow):
         self.pointer_overlay = QtWidgets.QLabel(self.video_label)
         self.pointer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         self.pointer_overlay.hide()
+
+        self.audio_controls = QtWidgets.QWidget()
+        audio_layout = QtWidgets.QHBoxLayout(self.audio_controls)
+        audio_layout.setContentsMargins(0, 0, 0, 0)
+        audio_layout.setSpacing(8)
+        self.audio_volume_label = QtWidgets.QLabel("Fogadott hang: 80%")
+        self.audio_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.audio_slider.setRange(0, 100)
+        self.audio_slider.setValue(80)
+        audio_layout.addWidget(self.audio_volume_label)
+        audio_layout.addWidget(self.audio_slider, 1)
+        vc_layout.addWidget(self.audio_controls)
 
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.addStretch(1)
@@ -1178,10 +1277,14 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
+        self.audio_slider.valueChanged.connect(self.on_audio_volume_changed)
 
         self.role_combo.currentIndexChanged.connect(self.on_role_changed)
         self.chk_relay.toggled.connect(
             lambda checked: self._save_setting("ui/prefer_relay", checked)
+        )
+        self.chk_share_audio.toggled.connect(
+            lambda checked: self._save_setting("ui/share_audio", checked)
         )
         self.res_combo.currentTextChanged.connect(
             lambda value: self._save_setting("ui/resolution", value)
@@ -1251,6 +1354,7 @@ class Main(QtWidgets.QMainWindow):
         self.core.msg_in.connect(self.inbox.appendPlainText)
         self.core.video_frame.connect(self.update_video)
         self.core.pointer.connect(self.on_pointer_update)
+        self.core.audio_samples.connect(self.on_audio_samples)
 
         async def _run():
             try: await self.core.start()
@@ -1265,6 +1369,7 @@ class Main(QtWidgets.QMainWindow):
         self.log_ui_message("Kapcsolat leállítása kezdeményezve.")
         self._pointer_timer.stop()
         self.hide_pointer_overlay()
+        self.audio_engine.reset()
         asyncio.create_task(core.stop())
 
     @QtCore.Slot()
@@ -1286,10 +1391,12 @@ class Main(QtWidgets.QMainWindow):
         label = self.res_combo.currentText()
         width, height = RESOLUTIONS[label]
         fps = self.fps_slider.value(); kbps = self.br_slider.value()
+        share_audio = self.chk_share_audio.isChecked()
+        audio_text = "hanggal" if share_audio else "hang nélkül"
         self.log_ui_message(
-            f"Képernyőmegosztás indítása: {label}, {fps} FPS, {kbps} kbps"
+            f"Képernyőmegosztás indítása: {label}, {fps} FPS, {kbps} kbps, {audio_text}"
         )
-        asyncio.create_task(self.core.start_share(width, height, fps, kbps))
+        asyncio.create_task(self.core.start_share(width, height, fps, kbps, share_audio))
 
     @QtCore.Slot()
     def on_share_stop(self):
@@ -1325,6 +1432,20 @@ class Main(QtWidgets.QMainWindow):
         self._save_setting("ui/bitrate", val)
         self._pending_bitrate = val
         self._br_debounce.start(200)
+
+    @QtCore.Slot(int)
+    def on_audio_volume_changed(self, value: int) -> None:
+        value = max(0, min(100, int(value)))
+        self.audio_volume_label.setText(f"Fogadott hang: {value}%")
+        self.audio_engine.set_volume(value / 100.0)
+        self._save_setting("ui/audio_volume", value)
+
+    @QtCore.Slot(bytes, int, int)
+    def on_audio_samples(self, payload: bytes, sample_rate: int, channels: int) -> None:
+        if sample_rate <= 0 or channels <= 0 or not payload:
+            self.audio_engine.reset()
+            return
+        self.audio_engine.enqueue(payload, sample_rate, channels)
 
     @QtCore.Slot(QtGui.QImage)
     def update_video(self, img: QtGui.QImage):
@@ -1589,12 +1710,34 @@ class Main(QtWidgets.QMainWindow):
         )
         self.br_slider.setValue(bitrate)
 
+        share_audio = self._to_bool(
+            self.settings.value("ui/share_audio", self.chk_share_audio.isChecked())
+        )
+        blocker = QtCore.QSignalBlocker(self.chk_share_audio)
+        try:
+            self.chk_share_audio.setChecked(share_audio)
+        finally:
+            del blocker
+
+        volume = self._to_int(
+            self.settings.value("ui/audio_volume", self.audio_slider.value()),
+            fallback=self.audio_slider.value(),
+        )
+        volume = max(0, min(100, volume))
+        blocker_slider = QtCore.QSignalBlocker(self.audio_slider)
+        try:
+            self.audio_slider.setValue(volume)
+        finally:
+            del blocker_slider
+        self.on_audio_volume_changed(volume)
+
     def _save_setting(self, key: str, value) -> None:
         self.settings.setValue(key, value)
 
     def _update_role_ui(self, role_value: str) -> None:
         is_sender = role_value == "sender"
         self.share_group.setVisible(is_sender)
+        self.audio_controls.setVisible(not is_sender)
 
     @staticmethod
     def _to_bool(value) -> bool:
