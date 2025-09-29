@@ -40,6 +40,24 @@ _CHANNELS = 2
 _BLOCK_DURATION = 0.02  # 20 ms
 
 
+def _downmix_to_stereo(data: np.ndarray) -> np.ndarray:
+    """Ensure the provided audio data is stereo."""
+
+    if data.ndim == 1:
+        data = np.expand_dims(data, axis=1)
+
+    channels = data.shape[1] if data.ndim > 1 else 1
+    if channels == 2:
+        return data
+    if channels <= 0:
+        return np.zeros((data.shape[0], 2), dtype=data.dtype)
+    if channels == 1:
+        return np.repeat(data, 2, axis=1)
+
+    mono = data.mean(axis=1, keepdims=True, dtype=data.dtype)
+    return np.repeat(mono, 2, axis=1)
+
+
 def _find_sounddevice_loopback_device() -> Optional[int]:  # pragma: no cover - thin wrapper
     if sd is None:
         return None
@@ -280,20 +298,47 @@ class SystemAudioTrack(AudioStreamTrack):
         except Exception:
             wasapi_settings = None
         try:
-            stream = sd.InputStream(
-                samplerate=_SAMPLE_RATE,
-                channels=_CHANNELS,
-                blocksize=self._block_frames,
-                dtype="float32",
-                device=device,
-                callback=self._on_sounddevice_audio,
-                extra_settings=wasapi_settings,
-            )
-            stream.start()
-        except Exception as exc:  # pragma: no cover - runtime guard
-            logger.error("Nem sikerült elindítani a rendszerhang rögzítését: %s", exc)
-            raise
-        self._sd_stream = stream
+            info = sd.query_devices(device)
+        except Exception:
+            info = {}
+
+        possible_channels: list[int] = []
+        for key in ("max_input_channels", "max_output_channels"):
+            value = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
+            if value:
+                possible_channels.append(int(value))
+        possible_channels.extend([_CHANNELS, 2, 1])
+
+        last_error: Optional[Exception] = None
+        seen: set[int] = set()
+        for channels in possible_channels:
+            if not channels:
+                continue
+            if channels in seen:
+                continue
+            seen.add(channels)
+            try:
+                stream = sd.InputStream(
+                    samplerate=_SAMPLE_RATE,
+                    channels=channels,
+                    blocksize=self._block_frames,
+                    dtype="float32",
+                    device=device,
+                    callback=self._on_sounddevice_audio,
+                    extra_settings=wasapi_settings,
+                )
+                stream.start()
+            except Exception as exc:  # pragma: no cover - runtime guard
+                last_error = exc
+                continue
+            self._sd_stream = stream
+            return
+
+        if last_error is not None:
+            logger.error("Nem sikerült elindítani a rendszerhang rögzítését: %s", last_error)
+            raise last_error
+
+        raise RuntimeError("Nem sikerült elindítani a rendszerhang rögzítését.")
 
     def _start_pyaudio_stream(self) -> None:
         if pyaudio is None:
@@ -357,6 +402,8 @@ class SystemAudioTrack(AudioStreamTrack):
         data = np.array(indata, dtype=np.float32)
         if data.ndim == 1:
             data = np.expand_dims(data, axis=1)
+        if data.shape[1] != _CHANNELS:
+            data = _downmix_to_stereo(data)
         if self._discord_meter.is_active():
             data = np.zeros_like(data)
         self._submit_audio_block(data.T)
@@ -374,6 +421,8 @@ class SystemAudioTrack(AudioStreamTrack):
             data = data.reshape(-1, _CHANNELS)
         except ValueError:
             data = data[: frame_count * _CHANNELS].reshape(-1, _CHANNELS)
+        if data.shape[1] != _CHANNELS:
+            data = _downmix_to_stereo(data)
         if self._discord_meter.is_active():
             data = np.zeros_like(data)
         self._submit_audio_block(data.T)
