@@ -21,6 +21,7 @@ from ..config import (
     ROOM_PIN,
     SIGNALING_WS,
 )
+from ..media.screenshare import CURSOR_MIN_SIZE, CURSOR_SCALE_RATIO
 from ..core import Core
 from ..media.audio import audio_playback_supported, audio_capture_supported
 from .style import style
