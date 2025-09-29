@@ -1016,3 +1016,12 @@ class Core(QtCore.QObject):
         if self._share_track:
             return self._share_track.get_last_capture_bbox()
         return None
+
+    def update_local_pointer(self, norm_x: float, norm_y: float, visible: bool) -> None:
+        track = self._share_track
+        if not track:
+            return
+        if visible:
+            track.set_local_pointer(norm_x, norm_y)
+        else:
+            track.clear_local_pointer()

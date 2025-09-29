@@ -279,6 +279,11 @@ class Main(QtWidgets.QMainWindow):
         self._pointer_local = False
         self._screen_pointer_overlay = ScreenPointerOverlay()
         self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
+        self._cursor_monitor_timer = QtCore.QTimer(self)
+        self._cursor_monitor_timer.setInterval(66)
+        self._cursor_monitor_timer.timeout.connect(self._poll_local_pointer)
+        self._cursor_monitor_last_visible = False
+        self._cursor_monitor_last_norm: Optional[Tuple[float, float]] = None
 
         self._loading_settings = False
         self._restore_settings()
@@ -310,6 +315,62 @@ class Main(QtWidgets.QMainWindow):
             self.log_ui_message(f"Bitráta módosítása: {value} kbps")
             asyncio.create_task(self.core.set_bitrate(value))
 
+    def _start_local_pointer_monitor(self) -> None:
+        if not self.core or self.core.role != "sender":
+            return
+        if not self._cursor_monitor_timer.isActive():
+            self._cursor_monitor_timer.start()
+        self._poll_local_pointer()
+
+    def _stop_local_pointer_monitor(self) -> None:
+        if self._cursor_monitor_timer.isActive():
+            self._cursor_monitor_timer.stop()
+        if self._cursor_monitor_last_visible and self.core:
+            self.core.update_local_pointer(0.0, 0.0, False)
+        self._cursor_monitor_last_visible = False
+        self._cursor_monitor_last_norm = None
+
+    def _poll_local_pointer(self) -> None:
+        if not self.core or self.core.role != "sender":
+            self._stop_local_pointer_monitor()
+            return
+        bbox = self.core.get_capture_geometry()
+        if not bbox:
+            if self._cursor_monitor_last_visible:
+                self.core.update_local_pointer(0.0, 0.0, False)
+                self._cursor_monitor_last_visible = False
+                self._cursor_monitor_last_norm = None
+            return
+        left, top, width, height = bbox
+        if width <= 0 or height <= 0:
+            if self._cursor_monitor_last_visible:
+                self.core.update_local_pointer(0.0, 0.0, False)
+                self._cursor_monitor_last_visible = False
+                self._cursor_monitor_last_norm = None
+            return
+        pos = QtGui.QCursor.pos()
+        norm_x = (pos.x() - left) / float(width)
+        norm_y = (pos.y() - top) / float(height)
+        if norm_x < 0.0 or norm_x > 1.0 or norm_y < 0.0 or norm_y > 1.0:
+            if self._cursor_monitor_last_visible:
+                self.core.update_local_pointer(0.0, 0.0, False)
+                self._cursor_monitor_last_visible = False
+                self._cursor_monitor_last_norm = None
+            return
+        norm_x = max(0.0, min(1.0, norm_x))
+        norm_y = max(0.0, min(1.0, norm_y))
+        last = self._cursor_monitor_last_norm
+        if (
+            self._cursor_monitor_last_visible
+            and last is not None
+            and abs(norm_x - last[0]) < 1e-3
+            and abs(norm_y - last[1]) < 1e-3
+        ):
+            return
+        self.core.update_local_pointer(norm_x, norm_y, True)
+        self._cursor_monitor_last_visible = True
+        self._cursor_monitor_last_norm = (norm_x, norm_y)
+
     @QtCore.Slot()
     def on_start(self):
         if self.core: return
@@ -334,7 +395,9 @@ class Main(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def on_stop(self):
         if not self.core: return
-        core = self.core; self.core = None
+        core = self.core
+        self._stop_local_pointer_monitor()
+        self.core = None
         self.log_ui_message("Kapcsolat leállítása kezdeményezve.")
         self._pointer_timer.stop()
         self.hide_pointer_overlay()
@@ -390,11 +453,13 @@ class Main(QtWidgets.QMainWindow):
             + (" + hang" if share_audio else "")
         )
         asyncio.create_task(self.core.start_share(width, height, fps, kbps, share_audio))
+        self._start_local_pointer_monitor()
 
     @QtCore.Slot()
     def on_share_stop(self):
         if self.core:
             self.log_ui_message("Képernyőmegosztás leállítása.")
+            self._stop_local_pointer_monitor()
             self.hide_pointer_overlay()
             asyncio.create_task(self.core.stop_share())
 
@@ -755,6 +820,7 @@ class Main(QtWidgets.QMainWindow):
         self.audio_volume_slider.setVisible(show_audio)
         if not is_sender:
             self._screen_pointer_overlay.hide_pointer()
+            self._stop_local_pointer_monitor()
 
     @staticmethod
     def _to_bool(value) -> bool:
