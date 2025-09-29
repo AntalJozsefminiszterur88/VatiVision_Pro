@@ -316,6 +316,13 @@ class SystemAudioTrack(AudioStreamTrack):
         info_input = _query_device("input")
         info_output = _query_device("output")
 
+        logger.debug(
+            "SoundDevice loopback eszközinformáció: default=%s input=%s output=%s",
+            info_default,
+            info_input,
+            info_output,
+        )
+
         possible_channels: list[int] = []
         for info in (info_default, info_input, info_output):
             for key in ("max_input_channels", "max_output_channels"):
@@ -324,33 +331,73 @@ class SystemAudioTrack(AudioStreamTrack):
                     possible_channels.append(int(value))
         possible_channels.extend([_CHANNELS, 2, 1])
 
+        possible_samplerates: list[int] = []
+        for info in (info_default, info_input, info_output):
+            samplerate = info.get("default_samplerate")
+            if samplerate:
+                try:
+                    possible_samplerates.append(int(round(float(samplerate))))
+                except Exception:
+                    continue
+        possible_samplerates.extend([_SAMPLE_RATE, 48_000, 44_100])
+
+        attempt_errors: list[str] = []
         last_error: Optional[Exception] = None
-        seen: set[int] = set()
-        for channels in possible_channels:
-            if not channels:
-                continue
-            if channels in seen:
-                continue
-            seen.add(channels)
-            try:
-                stream = sd.InputStream(
-                    samplerate=_SAMPLE_RATE,
-                    channels=channels,
-                    blocksize=self._block_frames,
-                    dtype="float32",
-                    device=device,
-                    callback=self._on_sounddevice_audio,
-                    extra_settings=wasapi_settings,
+
+        def _unique(values: list[int]) -> list[int]:
+            seen: set[int] = set()
+            ordered: list[int] = []
+            for value in values:
+                if not value:
+                    continue
+                if value in seen:
+                    continue
+                seen.add(value)
+                ordered.append(value)
+            return ordered
+
+        channels_to_try = _unique(possible_channels)
+        samplerates_to_try = _unique(possible_samplerates)
+
+        for channels in channels_to_try:
+            for samplerate in samplerates_to_try:
+                try:
+                    logger.debug(
+                        "SoundDevice loopback próbálkozás: device=%s channels=%s samplerate=%s",
+                        device,
+                        channels,
+                        samplerate,
+                    )
+                    stream = sd.InputStream(
+                        samplerate=samplerate,
+                        channels=channels,
+                        blocksize=self._block_frames,
+                        dtype="float32",
+                        device=device,
+                        callback=self._on_sounddevice_audio,
+                        extra_settings=wasapi_settings,
+                    )
+                    stream.start()
+                except Exception as exc:  # pragma: no cover - runtime guard
+                    last_error = exc
+                    attempt_errors.append(
+                        f"channels={channels}, samplerate={samplerate}: {exc}"
+                    )
+                    continue
+                self._sd_stream = stream
+                logger.debug(
+                    "SoundDevice loopback sikeresen elindítva: device=%s channels=%s samplerate=%s",
+                    device,
+                    channels,
+                    samplerate,
                 )
-                stream.start()
-            except Exception as exc:  # pragma: no cover - runtime guard
-                last_error = exc
-                continue
-            self._sd_stream = stream
-            return
+                return
 
         if last_error is not None:
-            logger.error("Nem sikerült elindítani a rendszerhang rögzítését: %s", last_error)
+            logger.error(
+                "Nem sikerült elindítani a rendszerhang rögzítését. Próbálkozások: %s",
+                "; ".join(attempt_errors),
+            )
             raise last_error
 
         raise RuntimeError("Nem sikerült elindítani a rendszerhang rögzítését.")

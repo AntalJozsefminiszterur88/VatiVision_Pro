@@ -72,11 +72,13 @@ def get_system_cursor_pixmap() -> Tuple[Optional[QtGui.QPixmap], Optional[int]]:
         class POINT(ctypes.Structure):
             _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
+        HCURSOR = getattr(wintypes, "HCURSOR", ctypes.c_void_p)
+
         class CURSORINFO(ctypes.Structure):
             _fields_ = [
                 ("cbSize", wintypes.DWORD),
                 ("flags", wintypes.DWORD),
-                ("hCursor", wintypes.HCURSOR),
+                ("hCursor", HCURSOR),
                 ("ptScreenPos", POINT),
             ]
 
