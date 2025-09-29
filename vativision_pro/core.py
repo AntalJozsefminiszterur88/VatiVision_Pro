@@ -121,6 +121,7 @@ class Core(QtCore.QObject):
         self._ws_task: Optional[asyncio.Task] = None
         self._pointer_hide_task: Optional[asyncio.Task] = None
         self._ice_retry_task: Optional[asyncio.Task] = None
+        self._max_ice_restart_attempts: int = 5
 
         self._state = ConnectionState.DISCONNECTED
         self._reconnect_attempt = 0
@@ -927,6 +928,16 @@ class Core(QtCore.QObject):
                 if state in {"connected", "completed"}:
                     break
                 attempt += 1
+                if attempt > self._max_ice_restart_attempts:
+                    self._emit_log(
+                        "ICE újrapróbálkozás: a maximális próbálkozásszám kimerült, teljes újracsatlakozás indítása.",
+                        logging.WARNING,
+                    )
+                    self._schedule_reconnect(
+                        "ICE újrapróbálkozás: a maximális próbálkozásszám kimerült.",
+                        min_delay=1.0,
+                    )
+                    break
                 if self.role != "sender":
                     self._emit_log(
                         "ICE újrapróbálkozás kihagyva – csak a küldő kezdeményezhet ICE restartot.",
