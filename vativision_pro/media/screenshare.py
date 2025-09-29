@@ -64,6 +64,8 @@ class ScreenShareTrack(VideoStreamTrack):
         self._cursor_cache_size: Optional[Tuple[int, int]] = None
         self._pointer_visible = False
         self._pointer_norm: Tuple[float, float] = (0.0, 0.0)
+        self._local_pointer_visible = False
+        self._local_pointer_norm: Tuple[float, float] = (0.0, 0.0)
         self._pointer_lock = threading.Lock()
         self._last_capture_bbox: Optional[Tuple[int, int, int, int]] = None
 
@@ -228,17 +230,22 @@ class ScreenShareTrack(VideoStreamTrack):
         if cursor is None:
             return img
         with self._pointer_lock:
-            if not self._pointer_visible:
-                return img
-            norm_x, norm_y = self._pointer_norm
+            pointer_states = []
+            if self._local_pointer_visible:
+                pointer_states.append(self._local_pointer_norm)
+            if self._pointer_visible:
+                pointer_states.append(self._pointer_norm)
+        if not pointer_states:
+            return img
         width, height = img.size
         cw, ch = cursor.size
-        x = int(round(norm_x * width + CURSOR_OFFSET_X))
-        y = int(round(norm_y * height + CURSOR_OFFSET_Y))
-        x = max(0, min(x, max(0, width - cw)))
-        y = max(0, min(y, max(0, height - ch)))
         base = img.convert("RGBA")
-        base.paste(cursor, (x, y), cursor)
+        for norm_x, norm_y in pointer_states:
+            x = int(round(norm_x * width + CURSOR_OFFSET_X))
+            y = int(round(norm_y * height + CURSOR_OFFSET_Y))
+            x = max(0, min(x, max(0, width - cw)))
+            y = max(0, min(y, max(0, height - ch)))
+            base.paste(cursor, (x, y), cursor)
         return base
 
     def set_remote_pointer(self, norm_x: float, norm_y: float) -> None:
@@ -249,6 +256,18 @@ class ScreenShareTrack(VideoStreamTrack):
     def clear_remote_pointer(self) -> None:
         with self._pointer_lock:
             self._pointer_visible = False
+
+    def set_local_pointer(self, norm_x: float, norm_y: float) -> None:
+        with self._pointer_lock:
+            self._local_pointer_visible = True
+            self._local_pointer_norm = (
+                float(max(0.0, min(1.0, norm_x))),
+                float(max(0.0, min(1.0, norm_y))),
+            )
+
+    def clear_local_pointer(self) -> None:
+        with self._pointer_lock:
+            self._local_pointer_visible = False
 
     def get_last_capture_bbox(self) -> Optional[Tuple[int, int, int, int]]:
         return self._last_capture_bbox
@@ -294,6 +313,7 @@ class ScreenShareTrack(VideoStreamTrack):
                 self._capture_executor = None
                 await loop.run_in_executor(None, executor.shutdown, True)
         self.clear_remote_pointer()
+        self.clear_local_pointer()
 
     def _close_capture_resources(self) -> None:
         if self._sct:
