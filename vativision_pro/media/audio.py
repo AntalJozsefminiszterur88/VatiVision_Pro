@@ -297,16 +297,31 @@ class SystemAudioTrack(AudioStreamTrack):
             wasapi_settings = sd.WasapiSettings(loopback=True)
         except Exception:
             wasapi_settings = None
-        try:
-            info = sd.query_devices(device)
-        except Exception:
-            info = {}
+        def _query_device(kind: Optional[str] = None) -> dict[str, float | int]:
+            try:
+                info = sd.query_devices(device, kind) if kind else sd.query_devices(device)
+            except Exception:
+                return {}
+            if isinstance(info, dict):
+                return info
+            # sounddevice can also return an object with attributes
+            extracted: dict[str, float | int] = {}
+            for key in ("max_input_channels", "max_output_channels", "default_samplerate"):
+                value = getattr(info, key, None)
+                if value is not None:
+                    extracted[key] = value
+            return extracted
+
+        info_default = _query_device()
+        info_input = _query_device("input")
+        info_output = _query_device("output")
 
         possible_channels: list[int] = []
-        for key in ("max_input_channels", "max_output_channels"):
-            value = info.get(key) if isinstance(info, dict) else getattr(info, key, None)
-            if value:
-                possible_channels.append(int(value))
+        for info in (info_default, info_input, info_output):
+            for key in ("max_input_channels", "max_output_channels"):
+                value = info.get(key)
+                if value:
+                    possible_channels.append(int(value))
         possible_channels.extend([_CHANNELS, 2, 1])
 
         last_error: Optional[Exception] = None
