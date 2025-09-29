@@ -22,7 +22,12 @@ from aiortc import (
 )
 from aiortc.exceptions import InvalidStateError
 
-from vati_screenshare import ScreenShareTrack, RESOLUTIONS
+from vati_screenshare import (
+    ScreenShareTrack,
+    RESOLUTIONS,
+    CURSOR_SCALE_RATIO,
+    CURSOR_MIN_SIZE,
+)
 
 def _resolve_documents_dir() -> Path:
     """Return the user's documents directory in a locale agnostic way."""
@@ -310,7 +315,9 @@ class FullscreenViewer(QtWidgets.QWidget):
         pixmap = self.label.pixmap()
         if not pixmap or pixmap.isNull():
             return None
-        target_width = max(24, int(pixmap.width() * 0.05))
+        target_width = max(
+            CURSOR_MIN_SIZE, int(round(pixmap.width() * CURSOR_SCALE_RATIO))
+        )
         target_width = min(target_width, self._cursor_pixmap.width())
         if target_width <= 0:
             return None
@@ -357,6 +364,101 @@ class FullscreenViewer(QtWidgets.QWidget):
         self.pointer_overlay.hide()
         self._pointer_norm = None
 
+
+class ScreenPointerOverlay(QtWidgets.QWidget):
+    """Transparent overlay window displayed over the shared monitor."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        flags = (
+            QtCore.Qt.Tool
+            | QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.WindowDoesNotAcceptFocus
+        )
+        super().__init__(parent, flags)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+        self.hide()
+
+        self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_scaled: Optional[QtGui.QPixmap] = None
+        self._cursor_scaled_width: int = 0
+        self._pointer_norm: Optional[Tuple[float, float]] = None
+        self._capture_bbox: Optional[Tuple[int, int, int, int]] = None
+
+        self.label = QtWidgets.QLabel(self)
+        self.label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.label.hide()
+
+    def set_cursor_source(self, pixmap: QtGui.QPixmap) -> None:
+        if pixmap and not pixmap.isNull():
+            self._cursor_pixmap = pixmap
+        else:
+            self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_scaled = None
+        self._cursor_scaled_width = 0
+        if self._pointer_norm and self._capture_bbox:
+            nx, ny = self._pointer_norm
+            self.show_pointer(nx, ny, self._capture_bbox)
+
+    def hide_pointer(self) -> None:
+        self._pointer_norm = None
+        self._capture_bbox = None
+        self.label.hide()
+        self.hide()
+
+    def show_pointer(
+        self, norm_x: float, norm_y: float, bbox: Tuple[int, int, int, int]
+    ) -> None:
+        if not self._cursor_pixmap or self._cursor_pixmap.isNull():
+            self.hide_pointer()
+            return
+        left, top, width, height = bbox
+        if width <= 0 or height <= 0:
+            self.hide_pointer()
+            return
+        pix = self._prepare_cursor_pixmap(width)
+        if pix is None:
+            self.hide_pointer()
+            return
+
+        self._pointer_norm = (
+            max(0.0, min(1.0, float(norm_x))),
+            max(0.0, min(1.0, float(norm_y))),
+        )
+        self._capture_bbox = bbox
+
+        self.setGeometry(left, top, width, height)
+        self.label.setPixmap(pix)
+        self.label.resize(pix.size())
+
+        nx, ny = self._pointer_norm
+        cw, ch = pix.width(), pix.height()
+        x = max(0, min(int(round(nx * width)), max(0, width - cw)))
+        y = max(0, min(int(round(ny * height)), max(0, height - ch)))
+        self.label.move(x, y)
+        self.label.show()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def _prepare_cursor_pixmap(self, capture_width: int) -> Optional[QtGui.QPixmap]:
+        if self._cursor_pixmap.isNull() or capture_width <= 0:
+            return None
+        target_width = max(
+            CURSOR_MIN_SIZE, int(round(capture_width * CURSOR_SCALE_RATIO))
+        )
+        target_width = min(target_width, self._cursor_pixmap.width())
+        if target_width <= 0:
+            return None
+        if self._cursor_scaled is None or self._cursor_scaled_width != target_width:
+            self._cursor_scaled = self._cursor_pixmap.scaledToWidth(
+                target_width, QtCore.Qt.SmoothTransformation
+            )
+            self._cursor_scaled_width = self._cursor_scaled.width()
+        return self._cursor_scaled
 
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
     ice_servers = [
@@ -1025,6 +1127,11 @@ class Core(QtCore.QObject):
             self._share_track.clear_remote_pointer()
         self.pointer.emit(0.0, 0.0, False)
 
+    def get_capture_geometry(self) -> Optional[Tuple[int, int, int, int]]:
+        if self._share_track:
+            return self._share_track.get_last_capture_bbox()
+        return None
+
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1211,6 +1318,8 @@ class Main(QtWidgets.QMainWindow):
         self._pointer_timer.timeout.connect(self.on_pointer_timeout)
         self._pointer_norm: Optional[Tuple[float, float]] = None
         self._pointer_local = False
+        self._screen_pointer_overlay = ScreenPointerOverlay()
+        self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -1295,6 +1404,7 @@ class Main(QtWidgets.QMainWindow):
     def on_share_stop(self):
         if self.core:
             self.log_ui_message("Képernyőmegosztás leállítása.")
+            self.hide_pointer_overlay()
             asyncio.create_task(self.core.stop_share())
 
     @QtCore.Slot(int)
@@ -1363,7 +1473,9 @@ class Main(QtWidgets.QMainWindow):
         pixmap = self.video_label.pixmap()
         if not pixmap or pixmap.isNull():
             return None
-        target_width = max(24, int(pixmap.width() * 0.05))
+        target_width = max(
+            CURSOR_MIN_SIZE, int(round(pixmap.width() * CURSOR_SCALE_RATIO))
+        )
         target_width = min(target_width, self._cursor_pixmap.width())
         if target_width <= 0:
             return None
@@ -1422,11 +1534,18 @@ class Main(QtWidgets.QMainWindow):
         self.pointer_overlay.hide()
         if self.fullscreen_window:
             self.fullscreen_window.hide_pointer_overlay()
+        self._screen_pointer_overlay.hide_pointer()
 
     @QtCore.Slot(float, float, bool)
     def on_pointer_update(self, norm_x: float, norm_y: float, visible: bool) -> None:
         if visible:
             self._show_pointer_overlay(norm_x, norm_y, local=False)
+            if self.core and self.core.role == "sender":
+                bbox = self.core.get_capture_geometry()
+                if bbox:
+                    self._screen_pointer_overlay.show_pointer(norm_x, norm_y, bbox)
+                else:
+                    self._screen_pointer_overlay.hide_pointer()
         else:
             self.hide_pointer_overlay()
 
@@ -1478,6 +1597,7 @@ class Main(QtWidgets.QMainWindow):
             self.fullscreen_window.close()
         self._save_setting("window/geometry", self.saveGeometry())
         self.settings.sync()
+        self._screen_pointer_overlay.close()
         if self._tray_icon and self._tray_icon.isVisible() and not self._allow_close:
             event.ignore()
             self.hide()
@@ -1595,6 +1715,8 @@ class Main(QtWidgets.QMainWindow):
     def _update_role_ui(self, role_value: str) -> None:
         is_sender = role_value == "sender"
         self.share_group.setVisible(is_sender)
+        if not is_sender:
+            self._screen_pointer_overlay.hide_pointer()
 
     @staticmethod
     def _to_bool(value) -> bool:
