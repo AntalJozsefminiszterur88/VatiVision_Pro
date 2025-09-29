@@ -108,9 +108,9 @@ class Main(QtWidgets.QMainWindow):
         self.br_slider.setRange(100, 50000); self.br_slider.setSingleStep(50); self.br_slider.setValue(4000)
         self.br_label = QtWidgets.QLabel("Bitráta: 4000 kbps")
 
+        self._audio_share_supported = audio_capture_supported()
         self.chk_share_audio = QtWidgets.QCheckBox("Hang megosztása")
-        if not audio_capture_supported():
-            self.chk_share_audio.setEnabled(False)
+        if not self._audio_share_supported:
             self.chk_share_audio.setToolTip(
                 "A rendszerhang megosztása ezen az eszközön nem támogatott."
             )
@@ -199,9 +199,7 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
-        self.chk_share_audio.toggled.connect(
-            lambda checked: self._save_setting("ui/share_audio", checked)
-        )
+        self.chk_share_audio.toggled.connect(self.on_share_audio_toggled)
         self.audio_volume_slider.valueChanged.connect(self.on_audio_volume_changed)
 
         self.role_combo.currentIndexChanged.connect(self.on_role_changed)
@@ -237,6 +235,7 @@ class Main(QtWidgets.QMainWindow):
         self._screen_pointer_overlay = ScreenPointerOverlay()
         self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
 
+        self._loading_settings = False
         self._restore_settings()
         self._update_role_ui(self.role_combo.currentData() or "sender")
 
@@ -608,48 +607,75 @@ class Main(QtWidgets.QMainWindow):
         self.btn_fullscreen.setText("Teljes képernyő")
 
     def _restore_settings(self) -> None:
-        geometry = self.settings.value("window/geometry")
-        if isinstance(geometry, (QtCore.QByteArray, bytes)) and geometry:
-            self.restoreGeometry(QtCore.QByteArray(geometry))
+        self._loading_settings = True
+        try:
+            geometry = self.settings.value("window/geometry")
+            if isinstance(geometry, (QtCore.QByteArray, bytes)) and geometry:
+                self.restoreGeometry(QtCore.QByteArray(geometry))
 
-        role = self.settings.value("ui/role", "sender")
-        idx = self.role_combo.findText(str(role))
-        if idx >= 0:
-            self.role_combo.setCurrentIndex(idx)
+            role = self.settings.value("ui/role", "sender")
+            idx = self.role_combo.findText(str(role))
+            if idx >= 0:
+                self.role_combo.setCurrentIndex(idx)
 
-        prefer = self.settings.value("ui/prefer_relay", False)
-        self.chk_relay.setChecked(self._to_bool(prefer))
+            prefer = self.settings.value("ui/prefer_relay", False)
+            self.chk_relay.setChecked(self._to_bool(prefer))
 
-        share_audio = self.settings.value("ui/share_audio", False)
-        self.chk_share_audio.setChecked(self._to_bool(share_audio))
+            share_audio = self.settings.value("ui/share_audio", False)
+            self.chk_share_audio.setChecked(self._to_bool(share_audio))
 
-        res = self.settings.value("ui/resolution")
-        if res:
-            r_idx = self.res_combo.findText(str(res))
-            if r_idx >= 0:
-                self.res_combo.setCurrentIndex(r_idx)
+            res = self.settings.value("ui/resolution")
+            if res:
+                r_idx = self.res_combo.findText(str(res))
+                if r_idx >= 0:
+                    self.res_combo.setCurrentIndex(r_idx)
 
-        fps = self._to_int(
-            self.settings.value("ui/fps", self.fps_slider.value()),
-            fallback=self.fps_slider.value(),
-        )
-        self.fps_slider.setValue(fps)
+            fps = self._to_int(
+                self.settings.value("ui/fps", self.fps_slider.value()),
+                fallback=self.fps_slider.value(),
+            )
+            self.fps_slider.setValue(fps)
 
-        bitrate = self._to_int(
-            self.settings.value("ui/bitrate", self.br_slider.value()),
-            fallback=self.br_slider.value(),
-        )
-        self.br_slider.setValue(bitrate)
+            bitrate = self._to_int(
+                self.settings.value("ui/bitrate", self.br_slider.value()),
+                fallback=self.br_slider.value(),
+            )
+            self.br_slider.setValue(bitrate)
 
-        audio_vol = self._to_int(
-            self.settings.value("ui/audio_volume", self.audio_volume_slider.value()),
-            fallback=self.audio_volume_slider.value(),
-        )
-        self.audio_volume_slider.setValue(audio_vol)
-        self.audio_volume_label.setText(f"Hang: {audio_vol}%")
+            audio_vol = self._to_int(
+                self.settings.value("ui/audio_volume", self.audio_volume_slider.value()),
+                fallback=self.audio_volume_slider.value(),
+            )
+            self.audio_volume_slider.setValue(audio_vol)
+            self.audio_volume_label.setText(f"Hang: {audio_vol}%")
+        finally:
+            self._loading_settings = False
 
     def _save_setting(self, key: str, value) -> None:
         self.settings.setValue(key, value)
+
+    @QtCore.Slot(bool)
+    def on_share_audio_toggled(self, checked: bool) -> None:
+        if self._loading_settings:
+            return
+
+        if not self._audio_share_supported:
+            if checked:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Hangmegosztás nem érhető el",
+                    (
+                        "Ez az eszköz nem támogatja a rendszerhang megosztását.\n"
+                        "Ellenőrizd, hogy Windows rendszert használsz-e és elérhető-e a"
+                        " szükséges hangmeghajtó."
+                    ),
+                )
+                self.chk_share_audio.blockSignals(True)
+                self.chk_share_audio.setChecked(False)
+                self.chk_share_audio.blockSignals(False)
+            return
+
+        self._save_setting("ui/share_audio", checked)
 
     def _update_role_ui(self, role_value: str) -> None:
         is_sender = role_value == "sender"
