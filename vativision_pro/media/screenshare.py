@@ -21,7 +21,8 @@ RESOLUTIONS = {
     "1080p (1920×1080)":(1920, 1080),
 }
 
-CURSOR_SCALE_RATIO = 0.025
+# A kurzor legyen ~15%-kal kisebb, ezért csökkentjük a skálázási arányt.
+CURSOR_SCALE_RATIO = 0.02125
 CURSOR_MIN_SIZE = 12
 CURSOR_OFFSET_X = -15
 CURSOR_OFFSET_Y = -10
