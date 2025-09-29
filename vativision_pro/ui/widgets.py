@@ -6,7 +6,13 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..media.screenshare import CURSOR_SCALE_RATIO, CURSOR_MIN_SIZE
+from ..media.screenshare import (
+    CURSOR_SCALE_RATIO,
+    CURSOR_MIN_SIZE,
+    CURSOR_OFFSET_X,
+    CURSOR_OFFSET_Y,
+)
+from .cursor_utils import sanitize_cursor_pixmap
 
 class AnimatedButton(QtWidgets.QPushButton):
     """QPushButton subclass that animates a subtle highlight when pressed."""
@@ -136,7 +142,7 @@ class FullscreenViewer(QtWidgets.QWidget):
 
     def set_cursor_source(self, pixmap: QtGui.QPixmap) -> None:
         if pixmap and not pixmap.isNull():
-            self._cursor_pixmap = pixmap
+            self._cursor_pixmap = sanitize_cursor_pixmap(pixmap)
         else:
             self._cursor_pixmap = QtGui.QPixmap()
         self._cursor_scaled = None
@@ -217,8 +223,8 @@ class FullscreenViewer(QtWidgets.QWidget):
         offset_x = max(0, (lw - pw) // 2)
         offset_y = max(0, (lh - ph) // 2)
         nx, ny = self._pointer_norm
-        x = offset_x + int(round(nx * pw))
-        y = offset_y + int(round(ny * ph))
+        x = offset_x + int(round(nx * pw + CURSOR_OFFSET_X))
+        y = offset_y + int(round(ny * ph + CURSOR_OFFSET_Y))
         ow = self.pointer_overlay.width()
         oh = self.pointer_overlay.height()
         x = max(0, min(x, lw - ow))
@@ -259,7 +265,7 @@ class ScreenPointerOverlay(QtWidgets.QWidget):
 
     def set_cursor_source(self, pixmap: QtGui.QPixmap) -> None:
         if pixmap and not pixmap.isNull():
-            self._cursor_pixmap = pixmap
+            self._cursor_pixmap = sanitize_cursor_pixmap(pixmap)
         else:
             self._cursor_pixmap = QtGui.QPixmap()
         self._cursor_scaled = None
@@ -301,8 +307,14 @@ class ScreenPointerOverlay(QtWidgets.QWidget):
 
         nx, ny = self._pointer_norm
         cw, ch = pix.width(), pix.height()
-        x = max(0, min(int(round(nx * width)), max(0, width - cw)))
-        y = max(0, min(int(round(ny * height)), max(0, height - ch)))
+        x = max(
+            0,
+            min(int(round(nx * width + CURSOR_OFFSET_X)), max(0, width - cw)),
+        )
+        y = max(
+            0,
+            min(int(round(ny * height + CURSOR_OFFSET_Y)), max(0, height - ch)),
+        )
         self.label.move(x, y)
         self.label.show()
         if not self.isVisible():
