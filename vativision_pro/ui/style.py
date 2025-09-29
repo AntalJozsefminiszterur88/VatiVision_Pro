@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .config import DARK_BG, DARK_CARD, DARK_ELEV, ACCENT, TEXT
+from ..config import DARK_BG, DARK_CARD, DARK_ELEV, ACCENT, TEXT
 
 def style():
     return f"""
