@@ -116,27 +116,52 @@ class SystemAudioTrack(AudioStreamTrack):
     # ------------------------------------------------------------------ utils
     def _find_loopback_device(self) -> Optional[int]:  # pragma: no cover - thin wrapper
         assert sd is not None
+
+        def _supports_loopback(idx: int) -> bool:
+            try:
+                info = sd.query_devices(idx)
+            except Exception:
+                return False
+            if info.get("max_output_channels", 0) < 1:
+                return False
+            hostapi_index = info.get("hostapi")
+            hostapi_name = ""
+            if hostapi_index is not None:
+                try:
+                    hostapi = sd.query_hostapis(hostapi_index)
+                    hostapi_name = str(hostapi.get("name", ""))
+                except Exception:
+                    hostapi_name = ""
+            return "wasapi" in hostapi_name.lower()
+
         try:
             default_output = sd.default.device[1]
         except Exception:
             default_output = None
-        if default_output is not None:
-            return int(default_output)
+
+        if isinstance(default_output, (list, tuple)):
+            default_output = default_output[0] if default_output else None
+
+        if isinstance(default_output, (int, float)):
+            idx = int(default_output)
+            if idx >= 0:
+                if _supports_loopback(idx):
+                    return idx
+
         devices = sd.query_devices()
-        for idx, dev in enumerate(devices):
-            hostapi_name = ""
-            try:
-                hostapi = sd.query_hostapis(dev.get("hostapi", 0))
-                hostapi_name = str(hostapi.get("name", ""))
-            except Exception:
-                pass
-            if "wasapi" in hostapi_name.lower() and dev.get("max_output_channels", 0) >= 2:
+        for idx, _ in enumerate(devices):
+            if _supports_loopback(idx):
                 return idx
+
         return None
 
     def _start_stream(self) -> None:
         assert sd is not None
         device = self._find_loopback_device()
+        if device is None:
+            raise RuntimeError(
+                "Nem található WASAPI kompatibilis hangeszköz a rendszerhang megosztásához."
+            )
         wasapi_settings = None
         try:
             wasapi_settings = sd.WasapiSettings(loopback=True)
