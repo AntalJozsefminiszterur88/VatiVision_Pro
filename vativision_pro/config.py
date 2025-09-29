@@ -33,7 +33,22 @@ def _iter_project_roots() -> list[Path]:
     return roots
 
 
-PROJECT_ROOT = _iter_project_roots()[0]
+def _resolve_project_root() -> Path:
+    """Select the most suitable base directory for bundled assets."""
+
+    for root in _iter_project_roots():
+        package_dir = root / "vativision_pro"
+        media_dir = package_dir / "media"
+        if media_dir.exists():
+            return root
+        if package_dir.exists():
+            return root
+
+    # Fallback to the repository checkout when nothing else matches.
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _resolve_project_root()
 MEDIA_DIR = PROJECT_ROOT / "vativision_pro" / "media"
 BONECA_AMBALABU_AUDIO = MEDIA_DIR / "boneca ambalabu.mp3"
 
