@@ -32,7 +32,7 @@ from ..core import Core
 from ..media.audio import audio_playback_supported, audio_capture_supported
 from .style import style
 from .widgets import AnimatedButton, VideoSurface, FullscreenViewer, ScreenPointerOverlay
-from .cursor_utils import sanitize_cursor_pixmap
+from .cursor_utils import sanitize_cursor_pixmap, get_system_cursor_pixmap
 
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
@@ -267,21 +267,20 @@ class Main(QtWidgets.QMainWindow):
 
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
-        if CURSOR_IMAGE_PATH.exists():
-            self._cursor_pixmap = sanitize_cursor_pixmap(
-                QtGui.QPixmap(str(CURSOR_IMAGE_PATH))
-            )
-        else:
-            self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_pixmap = QtGui.QPixmap()
+        self._fallback_cursor_pixmap = QtGui.QPixmap()
         self._cursor_scaled: Optional[QtGui.QPixmap] = None
         self._cursor_scaled_width: int = 0
+        self._cursor_handle: Optional[int] = None
+        self._load_default_cursor_pixmap()
         self._pointer_timer = QtCore.QTimer(self)
         self._pointer_timer.setSingleShot(True)
         self._pointer_timer.timeout.connect(self.on_pointer_timeout)
         self._pointer_norm: Optional[Tuple[float, float]] = None
         self._pointer_local = False
         self._screen_pointer_overlay = ScreenPointerOverlay()
-        self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
+        self._apply_cursor_pixmap(self._cursor_pixmap)
+        self._try_update_system_cursor_pixmap(force=True)
         self._cursor_monitor_timer = QtCore.QTimer(self)
         self._cursor_monitor_timer.setInterval(66)
         self._cursor_monitor_timer.timeout.connect(self._poll_local_pointer)
@@ -291,6 +290,60 @@ class Main(QtWidgets.QMainWindow):
         self._loading_settings = False
         self._restore_settings()
         self._update_role_ui(self.role_combo.currentData() or "sender")
+
+    def _load_default_cursor_pixmap(self) -> None:
+        """Load the bundled fallback cursor pixmap."""
+
+        pixmap = QtGui.QPixmap()
+        if CURSOR_IMAGE_PATH.exists():
+            pixmap = sanitize_cursor_pixmap(QtGui.QPixmap(str(CURSOR_IMAGE_PATH)))
+        if pixmap.isNull():
+            fallback_arrow = QtGui.QCursor(QtCore.Qt.ArrowCursor).pixmap()
+            if not fallback_arrow.isNull():
+                pixmap = sanitize_cursor_pixmap(fallback_arrow)
+        self._fallback_cursor_pixmap = pixmap
+        self._cursor_pixmap = pixmap
+        self._cursor_scaled = None
+        self._cursor_scaled_width = 0
+
+    def _apply_cursor_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        """Update every pointer overlay to use the provided pixmap."""
+
+        if pixmap and not pixmap.isNull():
+            pixmap = sanitize_cursor_pixmap(pixmap)
+        else:
+            pixmap = QtGui.QPixmap()
+
+        self._cursor_pixmap = pixmap
+        self._cursor_scaled = None
+        self._cursor_scaled_width = 0
+
+        if hasattr(self, "_screen_pointer_overlay"):
+            self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
+        if self.fullscreen_window:
+            self.fullscreen_window.set_cursor_source(self._cursor_pixmap)
+        if self.pointer_overlay.isVisible() and self._pointer_norm is not None:
+            nx, ny = self._pointer_norm
+            self._show_pointer_overlay(nx, ny, local=self._pointer_local)
+
+    def _try_update_system_cursor_pixmap(self, *, force: bool = False) -> None:
+        """Refresh the cursor pixmap from the operating system if available."""
+
+        pixmap, handle = get_system_cursor_pixmap()
+        if handle is None:
+            if force and self._cursor_pixmap.isNull() and not self._fallback_cursor_pixmap.isNull():
+                self._apply_cursor_pixmap(self._fallback_cursor_pixmap)
+            return
+
+        if not force and handle == self._cursor_handle:
+            return
+
+        self._cursor_handle = handle
+
+        if pixmap and not pixmap.isNull():
+            self._apply_cursor_pixmap(pixmap)
+        elif force and not self._fallback_cursor_pixmap.isNull():
+            self._apply_cursor_pixmap(self._fallback_cursor_pixmap)
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -337,6 +390,7 @@ class Main(QtWidgets.QMainWindow):
         if not self.core or self.core.role != "sender":
             self._stop_local_pointer_monitor()
             return
+        self._try_update_system_cursor_pixmap()
         bbox = self.core.get_capture_geometry()
         if not bbox:
             if self._cursor_monitor_last_visible:
