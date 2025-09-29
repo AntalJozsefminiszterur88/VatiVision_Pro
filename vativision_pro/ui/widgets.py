@@ -116,6 +116,9 @@ class FullscreenViewer(QtWidgets.QWidget):
 
         self.pointer_overlay = QtWidgets.QLabel(self.label)
         self.pointer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_NoSystemBackground)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.pointer_overlay.setStyleSheet("background: transparent;")
         self.pointer_overlay.hide()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -261,6 +264,9 @@ class ScreenPointerOverlay(QtWidgets.QWidget):
 
         self.label = QtWidgets.QLabel(self)
         self.label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.label.setAttribute(QtCore.Qt.WA_NoSystemBackground)
+        self.label.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.label.setStyleSheet("background: transparent;")
         self.label.hide()
 
     def set_cursor_source(self, pixmap: QtGui.QPixmap) -> None:

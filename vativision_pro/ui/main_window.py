@@ -187,6 +187,9 @@ class Main(QtWidgets.QMainWindow):
 
         self.pointer_overlay = QtWidgets.QLabel(self.video_label)
         self.pointer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_NoSystemBackground)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.pointer_overlay.setStyleSheet("background: transparent;")
         self.pointer_overlay.hide()
 
         controls_row = QtWidgets.QHBoxLayout()
