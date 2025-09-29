@@ -185,6 +185,11 @@ class Core(QtCore.QObject):
                 self._cancel_scheduled_reconnect()
                 self._cancel_ice_retry()
                 self._mark_connected()
+            elif state == "checking":
+                # Ha az ICE folyamat elakad az "ellenőrzés" állapotban, akkor
+                # ütemezzünk egy késleltetett újrapróbálkozást. Így nem kell a
+                # felhasználónak manuálisan újraindítania az alkalmazást.
+                self._ensure_ice_retry(initial_delay=5.0)
             elif state in {"failed", "disconnected"}:
                 self._emit_log(
                     f"ICE állapot: {state}. Újracsatlakozás indítása...",
@@ -193,7 +198,7 @@ class Core(QtCore.QObject):
                 min_delay = 1.0 if state == "failed" else 5.0
                 self._schedule_reconnect(f"ICE állapot: {state}.", min_delay=min_delay)
                 if state == "failed":
-                    self._ensure_ice_retry()
+                    self._ensure_ice_retry(force_restart=True)
 
         @self.pc.on("datachannel")
         def _dc(ch: RTCDataChannel):
@@ -893,20 +898,30 @@ class Core(QtCore.QObject):
             task.cancel()
         self._ice_retry_task = None
 
-    def _ensure_ice_retry(self) -> None:
+    def _ensure_ice_retry(self, *, initial_delay: float = 0.0, force_restart: bool = False) -> None:
         if self._stopping:
             return
         if self._ice_retry_task and not self._ice_retry_task.done():
-            return
+            if force_restart:
+                self._ice_retry_task.cancel()
+            else:
+                return
         pc = self.pc
         if pc is None:
             return
         loop = asyncio.get_running_loop()
-        self._ice_retry_task = loop.create_task(self._ice_retry_loop(pc))
+        self._ice_retry_task = loop.create_task(
+            self._ice_retry_loop(pc, initial_delay=initial_delay)
+        )
 
-    async def _ice_retry_loop(self, pc: RTCPeerConnection) -> None:
+    async def _ice_retry_loop(self, pc: RTCPeerConnection, *, initial_delay: float = 0.0) -> None:
         attempt = 0
         try:
+            if initial_delay > 0:
+                try:
+                    await asyncio.sleep(initial_delay)
+                except asyncio.CancelledError:
+                    raise
             while not self._stopping and self.pc is pc:
                 state = pc.iceConnectionState
                 if state in {"connected", "completed"}:
