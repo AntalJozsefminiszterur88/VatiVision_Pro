@@ -1028,11 +1028,18 @@ class Core(QtCore.QObject):
             return self._share_track.get_last_capture_bbox()
         return None
 
-    def update_local_pointer(self, norm_x: float, norm_y: float, visible: bool) -> None:
+    def update_local_pointer(
+        self,
+        norm_x: float,
+        norm_y: float,
+        visible: bool,
+        shape: Optional[str] = None,
+        cursor_handle: Optional[int] = None,
+    ) -> None:
         track = self._share_track
         if not track:
             return
         if visible:
-            track.set_local_pointer(norm_x, norm_y)
+            track.set_local_pointer(norm_x, norm_y, shape=shape, cursor_handle=cursor_handle)
         else:
             track.clear_local_pointer()

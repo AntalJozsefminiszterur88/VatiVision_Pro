@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets, QtMultimedia
 from qasync import QEventLoop
@@ -27,6 +27,7 @@ from ..media.screenshare import (
     CURSOR_SCALE_RATIO,
     CURSOR_OFFSET_X,
     CURSOR_OFFSET_Y,
+    FALLBACK_CURSOR_FILES,
 )
 from ..core import Core
 from ..media.audio import audio_playback_supported, audio_capture_supported
@@ -269,9 +270,11 @@ class Main(QtWidgets.QMainWindow):
         self._last_pixmap: Optional[QtGui.QPixmap] = None
         self._cursor_pixmap = QtGui.QPixmap()
         self._fallback_cursor_pixmap = QtGui.QPixmap()
+        self._fallback_cursor_pixmaps: Dict[str, QtGui.QPixmap] = {}
         self._cursor_scaled: Optional[QtGui.QPixmap] = None
         self._cursor_scaled_width: int = 0
         self._cursor_handle: Optional[int] = None
+        self._current_cursor_shape: Optional[str] = None
         self._load_default_cursor_pixmap()
         self._pointer_timer = QtCore.QTimer(self)
         self._pointer_timer.setSingleShot(True)
@@ -286,6 +289,7 @@ class Main(QtWidgets.QMainWindow):
         self._cursor_monitor_timer.timeout.connect(self._poll_local_pointer)
         self._cursor_monitor_last_visible = False
         self._cursor_monitor_last_norm: Optional[Tuple[float, float]] = None
+        self._cursor_monitor_last_shape: Optional[str] = None
 
         self._loading_settings = False
         self._restore_settings()
@@ -294,17 +298,36 @@ class Main(QtWidgets.QMainWindow):
     def _load_default_cursor_pixmap(self) -> None:
         """Load the bundled fallback cursor pixmap."""
 
-        pixmap = QtGui.QPixmap()
-        if CURSOR_IMAGE_PATH.exists():
-            pixmap = sanitize_cursor_pixmap(QtGui.QPixmap(str(CURSOR_IMAGE_PATH)))
-        if pixmap.isNull():
+        media_dir = CURSOR_IMAGE_PATH.parent
+        fallback: Dict[str, QtGui.QPixmap] = {}
+        for shape, filename in FALLBACK_CURSOR_FILES.items():
+            candidate = media_dir / filename
+            if not candidate.exists():
+                continue
+            pix = QtGui.QPixmap(str(candidate))
+            if pix.isNull():
+                continue
+            fallback[shape] = sanitize_cursor_pixmap(pix)
+
+        if "arrow" not in fallback and CURSOR_IMAGE_PATH.exists():
+            pix = sanitize_cursor_pixmap(QtGui.QPixmap(str(CURSOR_IMAGE_PATH)))
+            if not pix.isNull():
+                fallback["arrow"] = pix
+
+        if "arrow" not in fallback:
             fallback_arrow = QtGui.QCursor(QtCore.Qt.ArrowCursor).pixmap()
             if not fallback_arrow.isNull():
-                pixmap = sanitize_cursor_pixmap(fallback_arrow)
+                fallback["arrow"] = sanitize_cursor_pixmap(fallback_arrow)
+
+        self._fallback_cursor_pixmaps = fallback
+
+        pixmap = fallback.get("arrow", QtGui.QPixmap())
         self._fallback_cursor_pixmap = pixmap
         self._cursor_pixmap = pixmap
         self._cursor_scaled = None
         self._cursor_scaled_width = 0
+        if "arrow" in fallback:
+            self._current_cursor_shape = "arrow"
 
     def _apply_cursor_pixmap(self, pixmap: QtGui.QPixmap) -> None:
         """Update every pointer overlay to use the provided pixmap."""
@@ -326,24 +349,45 @@ class Main(QtWidgets.QMainWindow):
             nx, ny = self._pointer_norm
             self._show_pointer_overlay(nx, ny, local=self._pointer_local)
 
+    def _fallback_pixmap_for_shape(self, shape: Optional[str]) -> QtGui.QPixmap:
+        if shape and shape in self._fallback_cursor_pixmaps:
+            return self._fallback_cursor_pixmaps[shape]
+        return self._fallback_cursor_pixmap
+
     def _try_update_system_cursor_pixmap(self, *, force: bool = False) -> None:
         """Refresh the cursor pixmap from the operating system if available."""
 
-        pixmap, handle = get_system_cursor_pixmap()
+        pixmap, handle, shape = get_system_cursor_pixmap()
+
         if handle is None:
+            self._cursor_handle = None
             if force and self._cursor_pixmap.isNull() and not self._fallback_cursor_pixmap.isNull():
                 self._apply_cursor_pixmap(self._fallback_cursor_pixmap)
+            if shape:
+                self._current_cursor_shape = shape
             return
 
-        if not force and handle == self._cursor_handle:
-            return
+        if not force and handle == self._cursor_handle and shape == self._current_cursor_shape:
+            if pixmap is None or pixmap.isNull():
+                return
 
         self._cursor_handle = handle
+        if shape:
+            self._current_cursor_shape = shape
 
         if pixmap and not pixmap.isNull():
             self._apply_cursor_pixmap(pixmap)
-        elif force and not self._fallback_cursor_pixmap.isNull():
-            self._apply_cursor_pixmap(self._fallback_cursor_pixmap)
+        else:
+            fallback_shape = shape or self._current_cursor_shape
+            if fallback_shape is None and "arrow" in self._fallback_cursor_pixmaps:
+                fallback_shape = "arrow"
+            fallback = self._fallback_pixmap_for_shape(fallback_shape)
+            if not fallback.isNull():
+                if fallback_shape:
+                    self._current_cursor_shape = fallback_shape
+                self._apply_cursor_pixmap(fallback)
+            elif force and not self._fallback_cursor_pixmap.isNull():
+                self._apply_cursor_pixmap(self._fallback_cursor_pixmap)
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
@@ -385,18 +429,21 @@ class Main(QtWidgets.QMainWindow):
             self.core.update_local_pointer(0.0, 0.0, False)
         self._cursor_monitor_last_visible = False
         self._cursor_monitor_last_norm = None
+        self._cursor_monitor_last_shape = None
 
     def _poll_local_pointer(self) -> None:
         if not self.core or self.core.role != "sender":
             self._stop_local_pointer_monitor()
             return
         self._try_update_system_cursor_pixmap()
+        shape = self._current_cursor_shape
         bbox = self.core.get_capture_geometry()
         if not bbox:
             if self._cursor_monitor_last_visible:
                 self.core.update_local_pointer(0.0, 0.0, False)
                 self._cursor_monitor_last_visible = False
                 self._cursor_monitor_last_norm = None
+                self._cursor_monitor_last_shape = None
             return
         left, top, width, height = bbox
         if width <= 0 or height <= 0:
@@ -404,6 +451,7 @@ class Main(QtWidgets.QMainWindow):
                 self.core.update_local_pointer(0.0, 0.0, False)
                 self._cursor_monitor_last_visible = False
                 self._cursor_monitor_last_norm = None
+                self._cursor_monitor_last_shape = None
             return
         pos = QtGui.QCursor.pos()
         norm_x = (pos.x() - left) / float(width)
@@ -413,20 +461,30 @@ class Main(QtWidgets.QMainWindow):
                 self.core.update_local_pointer(0.0, 0.0, False)
                 self._cursor_monitor_last_visible = False
                 self._cursor_monitor_last_norm = None
+                self._cursor_monitor_last_shape = None
             return
         norm_x = max(0.0, min(1.0, norm_x))
         norm_y = max(0.0, min(1.0, norm_y))
         last = self._cursor_monitor_last_norm
+        last_shape = self._cursor_monitor_last_shape
         if (
             self._cursor_monitor_last_visible
             and last is not None
             and abs(norm_x - last[0]) < 1e-3
             and abs(norm_y - last[1]) < 1e-3
+            and shape == last_shape
         ):
             return
-        self.core.update_local_pointer(norm_x, norm_y, True)
+        self.core.update_local_pointer(
+            norm_x,
+            norm_y,
+            True,
+            shape,
+            self._cursor_handle,
+        )
         self._cursor_monitor_last_visible = True
         self._cursor_monitor_last_norm = (norm_x, norm_y)
+        self._cursor_monitor_last_shape = shape
 
     @QtCore.Slot()
     def on_start(self):
