@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Optional, Tuple
 import numpy as np
 from mss import mss
 from PIL import Image
+from PySide6 import QtGui
 from av import VideoFrame
 from aiortc import VideoStreamTrack
 
@@ -74,6 +76,27 @@ class ScreenShareTrack(VideoStreamTrack):
         self._init_capture()
 
     def _load_cursor(self) -> None:
+        if sys.platform.startswith("win"):
+            try:
+                from ..ui.cursor_utils import get_system_cursor_pixmap
+
+                pixmap, _ = get_system_cursor_pixmap()
+            except Exception:  # pragma: no cover - defensive guard
+                logger.exception("Nem sikerült lekérni a rendszer kurzorát.")
+                pixmap = None
+
+            if pixmap and not pixmap.isNull():
+                image = pixmap.toImage().convertToFormat(QtGui.QImage.Format_RGBA8888)
+                if not image.isNull() and image.width() > 0 and image.height() > 0:
+                    ptr = image.bits()
+                    ptr.setsize(image.width() * image.height() * 4)
+                    arr = np.frombuffer(ptr, np.uint8).reshape((image.height(), image.width(), 4))
+                    pil_cursor = Image.fromarray(arr, mode="RGBA")
+                    self._cursor_image = self._sanitize_cursor_transparency(pil_cursor)
+                    self._cursor_cache = None
+                    self._cursor_cache_size = None
+                    return
+
         cursor_path = Path(__file__).resolve().parent / "cursor.png"
         if not cursor_path.exists():
             logger.warning("A kurzor ikon (%s) nem található.", cursor_path)
