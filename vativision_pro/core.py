@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from enum import Enum, auto
 from time import perf_counter
 from typing import Optional, Tuple
 
@@ -45,6 +46,13 @@ class ShareParams:
     fps: int
     bitrate_kbps: int
     share_audio: bool
+
+
+class ConnectionState(Enum):
+    DISCONNECTED = auto()
+    CONNECTING = auto()
+    CONNECTED = auto()
+    RECONNECTING = auto()
 
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
     ice_servers = [
@@ -114,13 +122,55 @@ class Core(QtCore.QObject):
         self._pointer_hide_task: Optional[asyncio.Task] = None
         self._ice_retry_task: Optional[asyncio.Task] = None
 
+        self._state = ConnectionState.DISCONNECTED
+        self._reconnect_attempt = 0
+        self._backoff_steps = (2.0, 4.0, 8.0, 15.0)
+        self._max_backoff = 30.0
+
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
         self.log.emit(message)
 
+    def _set_state(self, state: ConnectionState) -> None:
+        if self._state is state:
+            return
+        self._logger.debug("Állapotváltás: %s -> %s", self._state.name, state.name)
+        self._state = state
+
     async def start(self):
+        if self._state not in {ConnectionState.DISCONNECTED}:
+            self._emit_log(
+                f"Start kihagyva – a jelenlegi állapot: {self._state.name}.",
+                logging.DEBUG,
+            )
+            return
         self._stopping = False
-        await self._establish_connection()
+        self._reconnect_attempt = 0
+        self._cancel_scheduled_reconnect()
+        await self._attempt_initial_connection()
+
+    async def _attempt_initial_connection(self) -> None:
+        if self._stopping:
+            return
+        self._set_state(ConnectionState.CONNECTING)
+        try:
+            await self._establish_connection()
+        except asyncio.CancelledError:
+            self._set_state(ConnectionState.DISCONNECTED)
+            raise
+        except Exception as exc:
+            if self._stopping:
+                self._set_state(ConnectionState.DISCONNECTED)
+                return
+            reason = f"Sikertelen kapcsolódás: {exc}"
+            self._emit_log(reason, logging.ERROR)
+            self._schedule_reconnect(reason)
+        else:
+            self._mark_connected()
+
+    def _mark_connected(self) -> None:
+        self._reconnect_attempt = 0
+        self._set_state(ConnectionState.CONNECTED)
 
     async def _establish_connection(self) -> None:
         self.status.emit("Indítás...")
@@ -134,13 +184,14 @@ class Core(QtCore.QObject):
                 self.status.emit("ICE: kapcsolódva ✅")
                 self._cancel_scheduled_reconnect()
                 self._cancel_ice_retry()
+                self._mark_connected()
             elif state in {"failed", "disconnected"}:
-                delay = 1.0 if state == "failed" else 5.0
                 self._emit_log(
                     f"ICE állapot: {state}. Újracsatlakozás indítása...",
                     logging.WARNING,
                 )
-                self._schedule_reconnect(f"ICE állapot: {state}.", delay)
+                min_delay = 1.0 if state == "failed" else 5.0
+                self._schedule_reconnect(f"ICE állapot: {state}.", min_delay=min_delay)
                 if state == "failed":
                     self._ensure_ice_retry()
 
@@ -432,7 +483,7 @@ class Core(QtCore.QObject):
         finally:
             if not self._stopping and self.ws is ws:
                 msg = reason or "A jelzéscsatorna lezárult, újracsatlakozás szükséges."
-                self._schedule_reconnect(msg, delay=3.0)
+                self._schedule_reconnect(msg, min_delay=3.0)
 
     def _cancel_scheduled_reconnect(self) -> Optional[asyncio.Task]:
         task = self._reconnect_task
@@ -441,16 +492,35 @@ class Core(QtCore.QObject):
         self._reconnect_task = None
         return task
 
-    def _schedule_reconnect(self, reason: str, delay: float = 3.0) -> None:
+    def _compute_reconnect_delay(self, attempt: int, min_delay: Optional[float]) -> float:
+        if attempt <= 0:
+            attempt = 1
+        if attempt <= len(self._backoff_steps):
+            delay = self._backoff_steps[attempt - 1]
+        else:
+            delay = self._max_backoff
+        if min_delay is not None:
+            delay = max(delay, float(min_delay))
+        if delay < 0.0:
+            delay = 0.0
+        if delay > self._max_backoff and (
+            min_delay is None or float(min_delay) <= self._max_backoff
+        ):
+            delay = self._max_backoff
+        return delay
+
+    def _schedule_reconnect(self, reason: str, *, min_delay: Optional[float] = None) -> None:
         if self._stopping:
             return
-        delay = max(0.0, delay)
+        self._set_state(ConnectionState.RECONNECTING)
+        self._reconnect_attempt += 1
+        delay = self._compute_reconnect_delay(self._reconnect_attempt, min_delay)
         display_delay = f"{delay:.1f}" if delay < 1.0 else f"{delay:.0f}"
-        self._emit_log(
-            f"{reason} Újracsatlakozás {display_delay} másodperc múlva...",
-            logging.WARNING,
-        )
-        self.status.emit("Újracsatlakozás előkészítése...")
+        base_reason = str(reason) if reason is not None else ""
+        clean_reason = " ".join(base_reason.strip().split()) if base_reason else "Kapcsolat megszakadt."
+        message = f"{clean_reason} Újrapróbálkozás {display_delay} másodperc múlva..."
+        self._emit_log(message, logging.WARNING)
+        self.status.emit(message)
         self._cancel_scheduled_reconnect()
         loop = asyncio.get_running_loop()
         self._reconnect_task = loop.create_task(self._reconnect_after(delay))
@@ -458,7 +528,15 @@ class Core(QtCore.QObject):
     async def _reconnect_after(self, delay: float):
         try:
             if delay > 0:
-                await asyncio.sleep(delay)
+                loop = asyncio.get_running_loop()
+                end_at = loop.time() + delay
+                while not self._stopping:
+                    remaining = end_at - loop.time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(1.0, remaining))
+                if self._stopping:
+                    return
             if self._stopping:
                 return
             self.status.emit("Újracsatlakozás...")
@@ -468,14 +546,7 @@ class Core(QtCore.QObject):
         except Exception as e:
             self._emit_log(f"Újracsatlakozás sikertelen: {e}", logging.ERROR)
             if not self._stopping:
-                next_delay = min(max(1.0, delay * 2), 60.0)
-                self._emit_log(
-                    f"Újracsatlakozás újrapróbálása {next_delay:.0f} másodperc múlva.",
-                    logging.WARNING,
-                )
-                self.status.emit("Újracsatlakozás előkészítése...")
-                loop = asyncio.get_running_loop()
-                self._reconnect_task = loop.create_task(self._reconnect_after(next_delay))
+                self._schedule_reconnect(f"Újracsatlakozás sikertelen: {e}")
         finally:
             if self._reconnect_task is asyncio.current_task():
                 self._reconnect_task = None
@@ -486,7 +557,11 @@ class Core(QtCore.QObject):
                 return
             self._emit_log("Újracsatlakozási kísérlet folyamatban...")
             await self._cleanup_connection(for_reconnect=True)
+            if self._stopping:
+                return
+            self._set_state(ConnectionState.CONNECTING)
             await self._establish_connection()
+            self._mark_connected()
             self._emit_log("Kapcsolat helyreállt.")
             self.status.emit("Kapcsolat helyreállt ✅")
             params = self._share_resume_params
@@ -554,6 +629,11 @@ class Core(QtCore.QObject):
 
         if not for_reconnect:
             self._share_resume_params = None
+            self._reconnect_attempt = 0
+            self._set_state(ConnectionState.DISCONNECTED)
+        else:
+            if not self._stopping:
+                self._set_state(ConnectionState.RECONNECTING)
 
     async def send_ping(self):
         if self.channel and self.channel.readyState == "open":
