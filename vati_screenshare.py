@@ -213,10 +213,15 @@ class ScreenShareTrack(VideoStreamTrack):
         fps = max(1, int(self._fps))
         period = 1.0 / float(fps)
         now = time.perf_counter()
-        wait = self._last_ts + period - now
+        if self._last_ts <= 0:
+            self._last_ts = now
+        target = self._last_ts + period
+        wait = target - now
         if wait > 0:
             await asyncio.sleep(wait)
-        self._last_ts = time.perf_counter()
+            self._last_ts = target
+        else:
+            self._last_ts = time.perf_counter()
 
         try:
             loop = asyncio.get_running_loop()
