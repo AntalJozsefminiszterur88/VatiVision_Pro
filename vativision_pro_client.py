@@ -168,58 +168,6 @@ class AnimatedButton(QtWidgets.QPushButton):
         self._animate_strength(0.0, 180)
 
 
-class FullscreenViewer(QtWidgets.QWidget):
-    """Window that displays the shared video feed in fullscreen."""
-
-    closed = QtCore.Signal()
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
-        super().__init__(parent, QtCore.Qt.Window)
-        self.setWindowTitle("VatiVision Pro — Teljes képernyő")
-        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
-
-        self._pixmap: Optional[QtGui.QPixmap] = None
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.label = QtWidgets.QLabel()
-        self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.label.setStyleSheet("background-color: black;")
-        layout.addWidget(self.label, 1)
-
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() == QtCore.Qt.Key_Escape:
-            self.close()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.closed.emit()
-        super().closeEvent(event)
-
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        self._update_scaled_pixmap()
-        super().resizeEvent(event)
-
-    def update_pixmap(self, pixmap: QtGui.QPixmap) -> None:
-        self._pixmap = pixmap
-        self._update_scaled_pixmap()
-
-    def _update_scaled_pixmap(self) -> None:
-        if not self._pixmap:
-            self.label.clear()
-            return
-        if self.width() <= 0 or self.height() <= 0:
-            return
-        scaled = self._pixmap.scaled(
-            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        )
-        self.label.setPixmap(scaled)
-
-
 class VideoSurface(QtWidgets.QLabel):
     """Clickable video surface that emits normalized coordinates."""
 
@@ -261,6 +209,153 @@ class VideoSurface(QtWidgets.QLabel):
         norm_x = float(local_x / pix_w)
         norm_y = float(local_y / pix_h)
         self.clicked.emit(norm_x, norm_y)
+
+
+class FullscreenViewer(QtWidgets.QWidget):
+    """Window that displays the shared video feed in fullscreen."""
+
+    closed = QtCore.Signal()
+    clicked = QtCore.Signal(float, float)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent, QtCore.Qt.Window)
+        self.setWindowTitle("VatiVision Pro — Teljes képernyő")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
+
+        self._pixmap: Optional[QtGui.QPixmap] = None
+        self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_scaled: Optional[QtGui.QPixmap] = None
+        self._cursor_scaled_width: int = 0
+        self._pointer_norm: Optional[Tuple[float, float]] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = VideoSurface()
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        self.label.setStyleSheet("background-color: black;")
+        self.label.clicked.connect(self.clicked.emit)
+        layout.addWidget(self.label, 1)
+
+        self.pointer_overlay = QtWidgets.QLabel(self.label)
+        self.pointer_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.pointer_overlay.hide()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.hide_pointer_overlay()
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self._update_scaled_pixmap()
+        self._reposition_pointer_overlay()
+        super().resizeEvent(event)
+
+    def update_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._pixmap = pixmap
+        self._update_scaled_pixmap()
+        self._reposition_pointer_overlay()
+
+    def set_cursor_source(self, pixmap: QtGui.QPixmap) -> None:
+        if pixmap and not pixmap.isNull():
+            self._cursor_pixmap = pixmap
+        else:
+            self._cursor_pixmap = QtGui.QPixmap()
+        self._cursor_scaled = None
+        self._cursor_scaled_width = 0
+        if self._pointer_norm is not None and self.pointer_overlay.isVisible():
+            nx, ny = self._pointer_norm
+            self._show_pointer_overlay(nx, ny)
+            self._reposition_pointer_overlay()
+
+    def update_pointer(self, norm_x: float, norm_y: float, visible: bool) -> None:
+        if not visible:
+            self.hide_pointer_overlay()
+            return
+        nx = max(0.0, min(1.0, float(norm_x)))
+        ny = max(0.0, min(1.0, float(norm_y)))
+        if not self._show_pointer_overlay(nx, ny):
+            self._pointer_norm = (nx, ny)
+            return
+        self._pointer_norm = (nx, ny)
+        self._reposition_pointer_overlay()
+
+    def _update_scaled_pixmap(self) -> None:
+        if not self._pixmap:
+            self.label.clear()
+            return
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        scaled = self._pixmap.scaled(
+            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
+        self.label.setPixmap(scaled)
+        if self._pointer_norm is not None:
+            nx, ny = self._pointer_norm
+            if not self.pointer_overlay.isVisible():
+                self._show_pointer_overlay(nx, ny)
+            self._reposition_pointer_overlay()
+
+    def _prepare_cursor_pixmap(self) -> Optional[QtGui.QPixmap]:
+        if self._cursor_pixmap.isNull():
+            return None
+        pixmap = self.label.pixmap()
+        if not pixmap or pixmap.isNull():
+            return None
+        target_width = max(24, int(pixmap.width() * 0.05))
+        target_width = min(target_width, self._cursor_pixmap.width())
+        if target_width <= 0:
+            return None
+        if self._cursor_scaled is None or self._cursor_scaled_width != target_width:
+            self._cursor_scaled = self._cursor_pixmap.scaledToWidth(
+                target_width, QtCore.Qt.SmoothTransformation
+            )
+            self._cursor_scaled_width = self._cursor_scaled.width()
+        return self._cursor_scaled
+
+    def _show_pointer_overlay(self, norm_x: float, norm_y: float) -> bool:
+        pix = self._prepare_cursor_pixmap()
+        if pix is None:
+            return False
+        self.pointer_overlay.setPixmap(pix)
+        self.pointer_overlay.resize(pix.size())
+        self.pointer_overlay.show()
+        self._pointer_norm = (norm_x, norm_y)
+        return True
+
+    def _reposition_pointer_overlay(self) -> None:
+        if self._pointer_norm is None or not self.pointer_overlay.isVisible():
+            return
+        pixmap = self.label.pixmap()
+        if not pixmap or pixmap.isNull():
+            self.hide_pointer_overlay()
+            return
+        lw, lh = self.label.width(), self.label.height()
+        pw, ph = pixmap.width(), pixmap.height()
+        if pw <= 0 or ph <= 0:
+            return
+        offset_x = max(0, (lw - pw) // 2)
+        offset_y = max(0, (lh - ph) // 2)
+        nx, ny = self._pointer_norm
+        x = offset_x + int(round(nx * pw))
+        y = offset_y + int(round(ny * ph))
+        ow = self.pointer_overlay.width()
+        oh = self.pointer_overlay.height()
+        x = max(0, min(x, lw - ow))
+        y = max(0, min(y, lh - oh))
+        self.pointer_overlay.move(x, y)
+
+    def hide_pointer_overlay(self) -> None:
+        self.pointer_overlay.hide()
+        self._pointer_norm = None
 
 
 def make_rtc_config(prefer_relay: bool) -> RTCConfiguration:
@@ -1238,6 +1333,11 @@ class Main(QtWidgets.QMainWindow):
         self._last_pixmap = pix
         if self.fullscreen_window and self.fullscreen_window.isVisible():
             self.fullscreen_window.update_pixmap(pix)
+            if self.pointer_overlay.isVisible() and self._pointer_norm is not None:
+                nx, ny = self._pointer_norm
+                self.fullscreen_window.update_pointer(nx, ny, True)
+            else:
+                self.fullscreen_window.hide_pointer_overlay()
         scaled = pix.scaled(
             self.video_label.size(),
             QtCore.Qt.KeepAspectRatio,
@@ -1287,6 +1387,8 @@ class Main(QtWidgets.QMainWindow):
         self.pointer_overlay.show()
         self._reposition_pointer_overlay()
         self._pointer_timer.start(2500)
+        if self.fullscreen_window:
+            self.fullscreen_window.update_pointer(nx, ny, True)
 
     def _reposition_pointer_overlay(self) -> None:
         if self._pointer_norm is None or not self.pointer_overlay.isVisible():
@@ -1309,12 +1411,17 @@ class Main(QtWidgets.QMainWindow):
         x = max(0, min(x, lw - ow))
         y = max(0, min(y, lh - oh))
         self.pointer_overlay.move(x, y)
+        if self.fullscreen_window and self.fullscreen_window.isVisible() and self._pointer_norm is not None:
+            nx, ny = self._pointer_norm
+            self.fullscreen_window.update_pointer(nx, ny, True)
 
     def hide_pointer_overlay(self) -> None:
         self._pointer_timer.stop()
         self._pointer_norm = None
         self._pointer_local = False
         self.pointer_overlay.hide()
+        if self.fullscreen_window:
+            self.fullscreen_window.hide_pointer_overlay()
 
     @QtCore.Slot(float, float, bool)
     def on_pointer_update(self, norm_x: float, norm_y: float, visible: bool) -> None:
@@ -1325,6 +1432,17 @@ class Main(QtWidgets.QMainWindow):
 
     @QtCore.Slot(float, float)
     def on_video_clicked(self, norm_x: float, norm_y: float) -> None:
+        if not self.core or self.core.role != "receiver":
+            return
+        pixmap = self.video_label.pixmap()
+        if not pixmap or pixmap.isNull():
+            return
+        self._show_pointer_overlay(norm_x, norm_y, local=True)
+        self.log_ui_message("Kurzor mutatása elküldve a küldőnek.")
+        asyncio.create_task(self.core.send_pointer(norm_x, norm_y))
+
+    @QtCore.Slot(float, float)
+    def on_fullscreen_clicked(self, norm_x: float, norm_y: float) -> None:
         if not self.core or self.core.role != "receiver":
             return
         pixmap = self.video_label.pixmap()
@@ -1417,6 +1535,8 @@ class Main(QtWidgets.QMainWindow):
         if self.fullscreen_window is None:
             self.fullscreen_window = FullscreenViewer(self)
             self.fullscreen_window.closed.connect(self.on_fullscreen_closed)
+            self.fullscreen_window.clicked.connect(self.on_fullscreen_clicked)
+            self.fullscreen_window.set_cursor_source(self._cursor_pixmap)
 
         if self.fullscreen_window.isVisible():
             self.fullscreen_window.close()
@@ -1425,6 +1545,11 @@ class Main(QtWidgets.QMainWindow):
 
         if self._last_pixmap:
             self.fullscreen_window.update_pixmap(self._last_pixmap)
+        if self.pointer_overlay.isVisible() and self._pointer_norm is not None:
+            nx, ny = self._pointer_norm
+            self.fullscreen_window.update_pointer(nx, ny, True)
+        else:
+            self.fullscreen_window.hide_pointer_overlay()
         self.fullscreen_window.showFullScreen()
         self.fullscreen_window.activateWindow()
         self.btn_fullscreen.setText("Kilépés a teljes képernyőből")
