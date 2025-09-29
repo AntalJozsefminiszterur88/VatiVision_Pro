@@ -21,6 +21,9 @@ RESOLUTIONS = {
     "1080p (1920×1080)":(1920, 1080),
 }
 
+CURSOR_SCALE_RATIO = 0.025
+CURSOR_MIN_SIZE = 12
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +63,7 @@ class ScreenShareTrack(VideoStreamTrack):
         self._pointer_visible = False
         self._pointer_norm: Tuple[float, float] = (0.0, 0.0)
         self._pointer_lock = threading.Lock()
+        self._last_capture_bbox: Optional[Tuple[int, int, int, int]] = None
 
         self._load_cursor()
         self._init_capture()
@@ -154,6 +158,13 @@ class ScreenShareTrack(VideoStreamTrack):
                 "height": int(mon["height"]),
             }
 
+        self._last_capture_bbox = (
+            int(bbox["left"]),
+            int(bbox["top"]),
+            int(bbox["width"]),
+            int(bbox["height"]),
+        )
+
         try:
             raw = self._sct.grab(bbox, include_cursor=True)
         except TypeError:
@@ -173,9 +184,9 @@ class ScreenShareTrack(VideoStreamTrack):
         if width <= 0 or height <= 0:
             return None
         base = self._cursor_image
-        target_width = min(base.width, max(24, int(width * 0.05)))
+        target_width = min(base.width, max(CURSOR_MIN_SIZE, int(width * CURSOR_SCALE_RATIO)))
         aspect = base.width / base.height if base.height else 1.0
-        target_height = min(base.height, max(24, int(target_width / aspect)))
+        target_height = min(base.height, max(CURSOR_MIN_SIZE, int(target_width / aspect)))
         size = (target_width, target_height)
         if self._cursor_cache is None or self._cursor_cache_size != size:
             self._cursor_cache = base.resize(size, Image.LANCZOS)
@@ -208,6 +219,9 @@ class ScreenShareTrack(VideoStreamTrack):
     def clear_remote_pointer(self) -> None:
         with self._pointer_lock:
             self._pointer_visible = False
+
+    def get_last_capture_bbox(self) -> Optional[Tuple[int, int, int, int]]:
+        return self._last_capture_bbox
 
     async def recv(self) -> VideoFrame:
         fps = max(1, int(self._fps))
