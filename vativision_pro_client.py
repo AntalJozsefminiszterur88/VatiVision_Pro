@@ -22,7 +22,7 @@ from aiortc import (
 )
 from aiortc.exceptions import InvalidStateError
 
-from vati_screenshare import ScreenShareTrack, RESOLUTIONS
+from vati_screenshare import DEFAULT_RESOLUTION_LABEL, RESOLUTIONS, ScreenShareTrack
 
 def _resolve_documents_dir() -> Path:
     """Return the user's documents directory in a locale agnostic way."""
@@ -314,7 +314,9 @@ class Core(QtCore.QObject):
         self._share_track: Optional[ScreenShareTrack] = None
         self._video_sender = None
         self._target_bitrate_bps: Optional[int] = None
-        self._share_resume_params: Optional[Tuple[int, int, int, int]] = None
+        self._share_resume_params: Optional[
+            Tuple[Optional[int], Optional[int], int, int]
+        ] = None
 
         self._pending_answer: Optional[asyncio.Future] = None
         self._offer_lock = asyncio.Lock()
@@ -773,7 +775,19 @@ class Core(QtCore.QObject):
         except Exception as exc:
             self._emit_log(f"Kurzor elrejtési üzenet küldési hiba: {exc}", logging.DEBUG)
 
-    async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
+    @staticmethod
+    def _format_resolution(width: Optional[int], height: Optional[int]) -> str:
+        if width is None or height is None:
+            return "natív felbontás (nincs átméretezés)"
+        return f"{width}×{height}"
+
+    async def start_share(
+        self,
+        width: Optional[int],
+        height: Optional[int],
+        fps: int,
+        bitrate_kbps: int,
+    ):
         if not self.pc:
             self._emit_log("Nincs aktív PeerConnection.", logging.WARNING)
             return
@@ -832,10 +846,12 @@ class Core(QtCore.QObject):
         self._emit_log("[media] Képernyőmegosztás leállítva.")
         self._cancel_pointer_hide()
 
-    async def set_resolution(self, width: int, height: int):
+    async def set_resolution(self, width: Optional[int], height: Optional[int]):
         if self._share_track:
             self._share_track.set_size(width, height)
-            self._emit_log(f"[media] Új felbontás: {width}×{height}")
+            self._emit_log(
+                f"[media] Új felbontás: {self._format_resolution(width, height)}"
+            )
         if self._share_resume_params:
             _, _, fps, kbps = self._share_resume_params
             self._share_resume_params = (width, height, fps, kbps)
@@ -1002,7 +1018,11 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo = QtWidgets.QComboBox()
         for label in RESOLUTIONS.keys():
             self.res_combo.addItem(label)
-        self.res_combo.setCurrentIndex(3)
+        try:
+            default_idx = list(RESOLUTIONS.keys()).index(DEFAULT_RESOLUTION_LABEL)
+        except ValueError:
+            default_idx = 0
+        self.res_combo.setCurrentIndex(default_idx)
 
         self.fps_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.fps_slider.setRange(0, 60); self.fps_slider.setValue(30)
@@ -1189,7 +1209,11 @@ class Main(QtWidgets.QMainWindow):
         if not self.core:
             self.log_ui_message("Előbb indítsd el a kapcsolatot.", logging.WARNING); return
         label = self.res_combo.currentText()
-        width, height = RESOLUTIONS[label]
+        size = RESOLUTIONS.get(label)
+        if size is None:
+            width = height = None
+        else:
+            width, height = size
         fps = self.fps_slider.value(); kbps = self.br_slider.value()
         self.log_ui_message(
             f"Képernyőmegosztás indítása: {label}, {fps} FPS, {kbps} kbps"
@@ -1213,7 +1237,11 @@ class Main(QtWidgets.QMainWindow):
     def on_res_changed(self):
         if not self.core: return
         label = self.res_combo.currentText()
-        width, height = RESOLUTIONS[label]
+        size = RESOLUTIONS.get(label)
+        if size is None:
+            width = height = None
+        else:
+            width, height = size
         self.log_ui_message(f"Felbontás váltása: {label}")
         asyncio.create_task(self.core.set_resolution(width, height))
 

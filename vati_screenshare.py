@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 from mss import mss
@@ -13,21 +13,28 @@ from PIL import Image
 from av import VideoFrame
 from aiortc import VideoStreamTrack
 
-RESOLUTIONS = {
-    "144p (256×144)":   (256, 144),
-    "240p (426×240)":   (426, 240),
-    "360p (640×360)":   (640, 360),
-    "720p (1280×720)":  (1280, 720),
-    "1080p (1920×1080)":(1920, 1080),
+ResolutionValue = Optional[Tuple[int, int]]
+
+RESOLUTIONS: dict[str, ResolutionValue] = {
+    "Natív felbontás (nincs átméretezés)": None,
+    "144p (256×144)": (256, 144),
+    "240p (426×240)": (426, 240),
+    "360p (640×360)": (640, 360),
+    "720p (1280×720)": (1280, 720),
+    "1080p (1920×1080)": (1920, 1080),
+    "1440p (2560×1440)": (2560, 1440),
+    "4K UHD (3840×2160)": (3840, 2160),
 }
+
+DEFAULT_RESOLUTION_LABEL = "720p (1280×720)"
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ShareConfig:
-    width: int = 1280
-    height: int = 720
+    width: Optional[int] = 1280
+    height: Optional[int] = 720
     fps: int = 30
     monitor_index: int = 0
     region: Optional[Tuple[int, int, int, int]] = None
@@ -36,14 +43,14 @@ class ShareConfig:
 class ScreenShareTrack(VideoStreamTrack):
     def __init__(
         self,
-        width: int,
-        height: int,
+        width: Optional[int],
+        height: Optional[int],
         fps: int,
         monitor_index: int = 0,
         region: Optional[Tuple[int, int, int, int]] = None,
     ):
         super().__init__()
-        self._size = (int(width), int(height))
+        self._size: Optional[Tuple[int, int]] = self._sanitize_size(width, height)
         self._fps = int(fps)
         self._requested_monitor = int(monitor_index)
         self._monitor_index = 0
@@ -78,8 +85,22 @@ class ScreenShareTrack(VideoStreamTrack):
         self._cursor_cache = None
         self._cursor_cache_size = None
 
-    def set_size(self, width: int, height: int):
-        self._size = (int(width), int(height))
+    def _sanitize_size(
+        self, width: Optional[Union[int, float]], height: Optional[Union[int, float]]
+    ) -> Optional[Tuple[int, int]]:
+        try:
+            if width is None or height is None:
+                return None
+            w = int(width)
+            h = int(height)
+        except (TypeError, ValueError):
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h)
+
+    def set_size(self, width: Optional[int], height: Optional[int]):
+        self._size = self._sanitize_size(width, height)
 
     def set_fps(self, fps: int):
         self._fps = int(fps)
