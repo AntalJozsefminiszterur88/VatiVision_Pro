@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtMultimedia
 from qasync import QEventLoop
 
 from ..config import (
@@ -14,6 +14,7 @@ from ..config import (
     APP_TITLE,
     BW_CHUNK,
     BW_SECONDS,
+    BONECA_AMBALABU_AUDIO,
     CURSOR_IMAGE_PATH,
     DARK_CARD,
     RESOLUTIONS,
@@ -95,7 +96,28 @@ class Main(QtWidgets.QMainWindow):
         self.btn_stop  = AnimatedButton("Leállítás")
         self.btn_ping  = AnimatedButton("Ping küldése (Küldő)")
         self.btn_bw    = AnimatedButton("Sávszél-teszt")
-        row2.addWidget(self.btn_start); row2.addWidget(self.btn_stop); row2.addWidget(self.btn_ping); row2.addWidget(self.btn_bw); row2.addStretch(1)
+        self.btn_boneca = AnimatedButton("Boneca Ambalabu")
+        self.btn_boneca.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #2ecc71;
+                color: #0b1d0f;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #27ae60;
+            }
+            QPushButton:pressed {
+                background-color: #1f8c4d;
+            }
+            """
+        )
+        row2.addWidget(self.btn_start)
+        row2.addWidget(self.btn_stop)
+        row2.addWidget(self.btn_ping)
+        row2.addWidget(self.btn_bw)
+        row2.addWidget(self.btn_boneca)
+        row2.addStretch(1)
         v.addLayout(row2)
 
         share = QtWidgets.QGroupBox("Képernyőmegosztás (küldő)")
@@ -196,11 +218,25 @@ class Main(QtWidgets.QMainWindow):
 
         self.settings = QtCore.QSettings("UMKGL Solutions", "VatiVision_Pro")
 
+        self._boneca_output = QtMultimedia.QAudioOutput(self)
+        self._boneca_output.setVolume(1.0)
+        self._boneca_player = QtMultimedia.QMediaPlayer(self)
+        self._boneca_player.setAudioOutput(self._boneca_output)
+        if BONECA_AMBALABU_AUDIO.exists():
+            self._boneca_player.setSource(
+                QtCore.QUrl.fromLocalFile(str(BONECA_AMBALABU_AUDIO))
+            )
+        else:
+            tip = "A 'boneca ambalabu.mp3' fájl nem található a media mappában."
+            self.btn_boneca.setEnabled(False)
+            self.btn_boneca.setToolTip(tip)
+
         self.core: Optional[Core] = None
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_ping.clicked.connect(self.on_ping)
         self.btn_bw.clicked.connect(self.on_bw)
+        self.btn_boneca.clicked.connect(self.on_boneca_clicked)
         self.btn_share_start.clicked.connect(self.on_share_start)
         self.btn_share_stop.clicked.connect(self.on_share_stop)
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
@@ -315,6 +351,31 @@ class Main(QtWidgets.QMainWindow):
         if not self.core: return
         self.log_ui_message("Sávszélesség teszt indítása.")
         asyncio.create_task(self.core.run_bw_test(BW_SECONDS, BW_CHUNK))
+
+    @QtCore.Slot()
+    def on_boneca_clicked(self):
+        if not BONECA_AMBALABU_AUDIO.exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Hiányzó fájl",
+                "A 'boneca ambalabu.mp3' fájl nem található a media mappában.",
+            )
+            return
+
+        if self._boneca_player.source().isEmpty():
+            self._boneca_player.setSource(
+                QtCore.QUrl.fromLocalFile(str(BONECA_AMBALABU_AUDIO))
+            )
+
+        if (
+            self._boneca_player.playbackState()
+            == QtMultimedia.QMediaPlayer.PlayingState
+        ):
+            self._boneca_player.setPosition(0)
+
+        self._boneca_player.play()
+        self.status.setText("Boneca Ambalabu lejátszása...")
+        self.log_ui_message("Boneca Ambalabu dallam lejátszása elindult.")
 
     @QtCore.Slot()
     def on_share_start(self):
