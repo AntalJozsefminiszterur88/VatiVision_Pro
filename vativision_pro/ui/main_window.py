@@ -21,11 +21,17 @@ from ..config import (
     ROOM_PIN,
     SIGNALING_WS,
 )
-from ..media.screenshare import CURSOR_MIN_SIZE, CURSOR_SCALE_RATIO
+from ..media.screenshare import (
+    CURSOR_MIN_SIZE,
+    CURSOR_SCALE_RATIO,
+    CURSOR_OFFSET_X,
+    CURSOR_OFFSET_Y,
+)
 from ..core import Core
 from ..media.audio import audio_playback_supported, audio_capture_supported
 from .style import style
 from .widgets import AnimatedButton, VideoSurface, FullscreenViewer, ScreenPointerOverlay
+from .cursor_utils import sanitize_cursor_pixmap
 
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
@@ -223,7 +229,9 @@ class Main(QtWidgets.QMainWindow):
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
         if CURSOR_IMAGE_PATH.exists():
-            self._cursor_pixmap = QtGui.QPixmap(str(CURSOR_IMAGE_PATH))
+            self._cursor_pixmap = sanitize_cursor_pixmap(
+                QtGui.QPixmap(str(CURSOR_IMAGE_PATH))
+            )
         else:
             self._cursor_pixmap = QtGui.QPixmap()
         self._cursor_scaled: Optional[QtGui.QPixmap] = None
@@ -445,8 +453,8 @@ class Main(QtWidgets.QMainWindow):
         offset_x = max(0, (lw - pw) // 2)
         offset_y = max(0, (lh - ph) // 2)
         nx, ny = self._pointer_norm
-        x = offset_x + int(round(nx * pw))
-        y = offset_y + int(round(ny * ph))
+        x = offset_x + int(round(nx * pw + CURSOR_OFFSET_X))
+        y = offset_y + int(round(ny * ph + CURSOR_OFFSET_Y))
         ow = self.pointer_overlay.width()
         oh = self.pointer_overlay.height()
         x = max(0, min(x, lw - ow))

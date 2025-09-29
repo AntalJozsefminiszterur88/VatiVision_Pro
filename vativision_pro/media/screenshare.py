@@ -23,8 +23,8 @@ RESOLUTIONS = {
 
 CURSOR_SCALE_RATIO = 0.025
 CURSOR_MIN_SIZE = 12
-CURSOR_OFFSET_X = -5
-CURSOR_OFFSET_Y = -5
+CURSOR_OFFSET_X = -15
+CURSOR_OFFSET_Y = -10
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +87,28 @@ class ScreenShareTrack(VideoStreamTrack):
 
     @staticmethod
     def _sanitize_cursor_transparency(img: Image.Image) -> Image.Image:
-        """Távolítsa el a kurzor háttérszínét, ha az opák."""
+        """Távolítsa el a kurzor háttér- vagy árnyék sziluettjét."""
         if img.mode != "RGBA":
-            return img
+            img = img.convert("RGBA")
         arr = np.array(img)
         if arr.ndim != 3 or arr.shape[2] != 4:
             return img
-        background = arr[0, 0, :3]
-        alpha = arr[0, 0, 3]
-        if alpha == 0:
-            return img
-        mask = np.all(arr[:, :, :3] == background, axis=-1)
+
+        rgb = arr[:, :, :3].astype(np.int16)
+        alpha = arr[:, :, 3]
+        background = rgb[0, 0]
+
+        diff = np.abs(rgb - background)
+        mask_background = np.all(diff <= 12, axis=-1)
+
+        brightness = rgb.max(axis=-1)
+        mask_shadow = (brightness < 40) & (alpha < 220)
+
+        mask = mask_background | mask_shadow
         if not np.any(mask):
             return img
+
+        arr[mask, :3] = 0
         arr[mask, 3] = 0
         return Image.fromarray(arr, mode="RGBA")
 
