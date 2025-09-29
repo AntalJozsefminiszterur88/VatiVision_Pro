@@ -420,6 +420,7 @@ class Core(QtCore.QObject):
         self._restart_lock = asyncio.Lock()
         self._ws_task: Optional[asyncio.Task] = None
         self._pointer_hide_task: Optional[asyncio.Task] = None
+        self._ice_retry_task: Optional[asyncio.Task] = None
 
     def _emit_log(self, message: str, level: int = logging.INFO) -> None:
         self._logger.log(level, message)
@@ -440,6 +441,7 @@ class Core(QtCore.QObject):
             if state == "connected":
                 self.status.emit("ICE: kapcsolódva ✅")
                 self._cancel_scheduled_reconnect()
+                self._cancel_ice_retry()
             elif state in {"failed", "disconnected"}:
                 delay = 1.0 if state == "failed" else 5.0
                 self._emit_log(
@@ -447,6 +449,8 @@ class Core(QtCore.QObject):
                     logging.WARNING,
                 )
                 self._schedule_reconnect(f"ICE állapot: {state}.", delay)
+                if state == "failed":
+                    self._ensure_ice_retry()
 
         @self.pc.on("datachannel")
         def _dc(ch: RTCDataChannel):
@@ -794,6 +798,7 @@ class Core(QtCore.QObject):
         self._clear_pending_answer(cancel=True)
         self._cancel_pointer_hide()
         self.pointer.emit(0.0, 0.0, False)
+        self._cancel_ice_retry()
 
         ws_task = self._ws_task
         self._ws_task = None
@@ -987,6 +992,79 @@ class Core(QtCore.QObject):
                 pass
         await self._cleanup_connection(for_reconnect=False)
         self.status.emit("Leállítva")
+
+    def _cancel_ice_retry(self) -> None:
+        task = self._ice_retry_task
+        if task and not task.done():
+            task.cancel()
+        self._ice_retry_task = None
+
+    def _ensure_ice_retry(self) -> None:
+        if self._stopping:
+            return
+        if self._ice_retry_task and not self._ice_retry_task.done():
+            return
+        pc = self.pc
+        if pc is None:
+            return
+        loop = asyncio.get_running_loop()
+        self._ice_retry_task = loop.create_task(self._ice_retry_loop(pc))
+
+    async def _ice_retry_loop(self, pc: RTCPeerConnection) -> None:
+        attempt = 0
+        try:
+            while not self._stopping and self.pc is pc:
+                state = pc.iceConnectionState
+                if state in {"connected", "completed"}:
+                    break
+                attempt += 1
+                if self.role != "sender":
+                    self._emit_log(
+                        "ICE újrapróbálkozás kihagyva – csak a küldő kezdeményezhet ICE restartot.",
+                        logging.DEBUG,
+                    )
+                    break
+                try:
+                    await self._perform_ice_restart(pc, attempt)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._emit_log(
+                        f"ICE újrapróbálkozás #{attempt} sikertelen: {exc}",
+                        logging.WARNING,
+                    )
+                await asyncio.sleep(min(10.0, 2.0 * attempt))
+        finally:
+            if self._ice_retry_task is asyncio.current_task():
+                self._ice_retry_task = None
+
+    async def _perform_ice_restart(self, pc: RTCPeerConnection, attempt: int) -> None:
+        if self.ws is None:
+            raise RuntimeError("ICE újrapróbálkozás: a jelzéscsatorna nem elérhető.")
+        await self._wait_for_pending_answer()
+        async with self._offer_lock:
+            if self.pc is not pc:
+                return
+            state = getattr(pc, "signalingState", None)
+            if state and state != "stable":
+                self._emit_log(
+                    "ICE restart nem indítható – a jelzési állapot nem stabil.",
+                    logging.DEBUG,
+                )
+                return
+            self._emit_log(f"ICE újrapróbálkozás #{attempt} indítása...", logging.INFO)
+            offer = await pc.createOffer(iceRestart=True)
+            await pc.setLocalDescription(offer)
+            await wait_ice_complete(pc)
+            await self.ws.send_json(
+                {
+                    "op": "offer",
+                    "sdp": {
+                        "type": pc.localDescription.type,
+                        "sdp": pc.localDescription.sdp,
+                    },
+                }
+            )
 
     def _on_remote_pointer(self, norm_x: float, norm_y: float, visible: bool) -> None:
         nx = max(0.0, min(1.0, float(norm_x)))
