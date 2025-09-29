@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -19,6 +20,11 @@ try:  # pragma: no cover - optional dependency
     import sounddevice as sd
 except Exception:  # pragma: no cover - handled gracefully
     sd = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    import pyaudio
+except Exception:  # pragma: no cover - handled gracefully
+    pyaudio = None  # type: ignore
 
 try:  # pragma: no cover - optional dependency
     from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
@@ -34,10 +40,137 @@ _CHANNELS = 2
 _BLOCK_DURATION = 0.02  # 20 ms
 
 
+def _find_sounddevice_loopback_device() -> Optional[int]:  # pragma: no cover - thin wrapper
+    if sd is None:
+        return None
+
+    def _supports_loopback(idx: int) -> bool:
+        try:
+            info = sd.query_devices(idx)
+        except Exception:
+            return False
+        if info.get("max_output_channels", 0) < 1:
+            return False
+        hostapi_index = info.get("hostapi")
+        hostapi_name = ""
+        if hostapi_index is not None:
+            try:
+                hostapi = sd.query_hostapis(hostapi_index)
+                hostapi_name = str(hostapi.get("name", ""))
+            except Exception:
+                hostapi_name = ""
+        return "wasapi" in hostapi_name.lower()
+
+    try:
+        default_output = sd.default.device[1]
+    except Exception:
+        default_output = None
+
+    if isinstance(default_output, (list, tuple)):
+        default_output = default_output[0] if default_output else None
+
+    if isinstance(default_output, (int, float)):
+        idx = int(default_output)
+        if idx >= 0 and _supports_loopback(idx):
+            return idx
+
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        logger.debug("Nem sikerült lekérdezni a sounddevice eszközöket.", exc_info=True)
+        return None
+
+    for idx, _ in enumerate(devices):
+        if _supports_loopback(idx):
+            return idx
+
+    return None
+
+
+def _sounddevice_capture_supported() -> bool:
+    if sd is None or not sys.platform.startswith("win"):
+        return False
+    return _find_sounddevice_loopback_device() is not None
+
+
+@lru_cache(maxsize=1)
+def _pyaudio_loopback_device_index() -> Optional[int]:
+    """Return the PyAudio device index capable of WASAPI loopback capture."""
+
+    if pyaudio is None or not sys.platform.startswith("win"):
+        return None
+
+    try:
+        pa = pyaudio.PyAudio()
+    except Exception:
+        logger.debug("Nem sikerült inicializálni a PyAudio-t.", exc_info=True)
+        return None
+
+    try:
+        try:
+            host_api = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        except Exception:
+            logger.debug("A PyAudio nem támogatja a WASAPI host API-t.", exc_info=True)
+            return None
+
+        wasapi_index = host_api.get("index")
+        if wasapi_index is None:
+            return None
+
+        try:
+            default_loopback = pa.get_default_wasapi_loopback_device()
+        except Exception:
+            default_loopback = None
+
+        if default_loopback is not None:
+            device_index = default_loopback.get("index")
+        else:
+            device_index = None
+            for idx in range(pa.get_device_count()):
+                try:
+                    info = pa.get_device_info_by_index(idx)
+                except Exception:
+                    continue
+                if info.get("hostApi") != wasapi_index:
+                    continue
+                if info.get("isLoopbackDevice"):
+                    device_index = idx
+                    break
+
+        if device_index is None:
+            logger.debug("PyAudio: nem található loopback eszköz.")
+            return None
+
+        try:
+            pa.is_format_supported(
+                rate=_SAMPLE_RATE,
+                input_device=device_index,
+                input_channels=_CHANNELS,
+                input_format=pyaudio.paFloat32,
+            )
+        except Exception:
+            logger.debug(
+                "PyAudio: a kiválasztott eszköz nem támogatja a kívánt formátumot.",
+                exc_info=True,
+            )
+            return None
+
+        return int(device_index)
+    finally:
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+
+
+def _pyaudio_capture_supported() -> bool:
+    return _pyaudio_loopback_device_index() is not None
+
+
 def audio_capture_supported() -> bool:
     """Return True if loopback capture is supported on this platform."""
 
-    return bool(sd) and sys.platform.startswith("win")
+    return _sounddevice_capture_supported() or _pyaudio_capture_supported()
 
 
 def audio_playback_supported() -> bool:
@@ -109,60 +242,39 @@ class SystemAudioTrack(AudioStreamTrack):
         self._block_frames = int(_SAMPLE_RATE * block_duration)
         self._discord_meter = _DiscordMeter()
         self._closing = False
-        self._stream: Optional[sd.InputStream] = None
         self._stream_lock = threading.Lock()
-        self._start_stream()
+        self._sd_stream: Optional[sd.InputStream] = None
+        self._pa: Optional[pyaudio.PyAudio] = None  # type: ignore[assignment]
+        self._pa_stream: Optional[object] = None
+        self._backend: Optional[str] = None
 
-    # ------------------------------------------------------------------ utils
-    def _find_loopback_device(self) -> Optional[int]:  # pragma: no cover - thin wrapper
-        assert sd is not None
-
-        def _supports_loopback(idx: int) -> bool:
+        errors: list[str] = []
+        if _sounddevice_capture_supported():
             try:
-                info = sd.query_devices(idx)
-            except Exception:
-                return False
-            if info.get("max_output_channels", 0) < 1:
-                return False
-            hostapi_index = info.get("hostapi")
-            hostapi_name = ""
-            if hostapi_index is not None:
-                try:
-                    hostapi = sd.query_hostapis(hostapi_index)
-                    hostapi_name = str(hostapi.get("name", ""))
-                except Exception:
-                    hostapi_name = ""
-            return "wasapi" in hostapi_name.lower()
+                self._start_sounddevice_stream()
+                self._backend = "sounddevice"
+            except Exception as exc:
+                errors.append(f"sounddevice: {exc}")
+        if self._backend is None and _pyaudio_capture_supported():
+            try:
+                self._start_pyaudio_stream()
+                self._backend = "pyaudio"
+            except Exception as exc:
+                errors.append(f"pyaudio: {exc}")
 
-        try:
-            default_output = sd.default.device[1]
-        except Exception:
-            default_output = None
+        if self._backend is None:
+            detail = f" Részletek: {'; '.join(errors)}" if errors else ""
+            raise RuntimeError("Nem sikerült elindítani a rendszerhang megosztását." + detail)
 
-        if isinstance(default_output, (list, tuple)):
-            default_output = default_output[0] if default_output else None
-
-        if isinstance(default_output, (int, float)):
-            idx = int(default_output)
-            if idx >= 0:
-                if _supports_loopback(idx):
-                    return idx
-
-        devices = sd.query_devices()
-        for idx, _ in enumerate(devices):
-            if _supports_loopback(idx):
-                return idx
-
-        return None
-
-    def _start_stream(self) -> None:
-        assert sd is not None
-        device = self._find_loopback_device()
+    # ------------------------------------------------------------------ helpers
+    def _start_sounddevice_stream(self) -> None:
+        if sd is None:
+            raise RuntimeError("A sounddevice modul nem érhető el.")
+        device = _find_sounddevice_loopback_device()
         if device is None:
             raise RuntimeError(
                 "Nem található WASAPI kompatibilis hangeszköz a rendszerhang megosztásához."
             )
-        wasapi_settings = None
         try:
             wasapi_settings = sd.WasapiSettings(loopback=True)
         except Exception:
@@ -174,28 +286,53 @@ class SystemAudioTrack(AudioStreamTrack):
                 blocksize=self._block_frames,
                 dtype="float32",
                 device=device,
-                callback=self._on_audio,
+                callback=self._on_sounddevice_audio,
                 extra_settings=wasapi_settings,
             )
             stream.start()
-            self._stream = stream
         except Exception as exc:  # pragma: no cover - runtime guard
             logger.error("Nem sikerült elindítani a rendszerhang rögzítését: %s", exc)
             raise
+        self._sd_stream = stream
 
-    def _on_audio(self, indata, frames, time_info, status):  # pragma: no cover - realtime callback
-        if status:
-            logger.debug("Rendszerhang stream státusz: %s", status)
-        if self._closing:
-            return
-        data = np.array(indata, dtype=np.float32)
-        if data.ndim == 1:
-            data = np.expand_dims(data, axis=1)
-        if self._discord_meter.is_active():
-            data = np.zeros_like(data)
-        data = data.T  # convert to (channels, samples)
+    def _start_pyaudio_stream(self) -> None:
+        if pyaudio is None:
+            raise RuntimeError("A PyAudio modul nem érhető el.")
+        device_index = _pyaudio_loopback_device_index()
+        if device_index is None:
+            raise RuntimeError(
+                "Nem található WASAPI loopback eszköz a PyAudio számára."
+            )
+        try:
+            stream_info = pyaudio.PaWasapiStreamInfo(flags=pyaudio.paWinWasapiLoopback)
+        except Exception as exc:
+            raise RuntimeError("A PyAudio nem támogatja a WASAPI loopback módot.") from exc
 
-        def _put():
+        pa = pyaudio.PyAudio()
+        try:
+            stream = pa.open(
+                format=pyaudio.paFloat32,
+                channels=_CHANNELS,
+                rate=_SAMPLE_RATE,
+                frames_per_buffer=self._block_frames,
+                input=True,
+                input_device_index=device_index,
+                stream_callback=self._on_pyaudio_audio,
+                start=False,
+                stream_info=stream_info,
+            )
+            stream.start_stream()
+        except Exception:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+            raise
+        self._pa = pa
+        self._pa_stream = stream
+
+    def _submit_audio_block(self, data: np.ndarray) -> None:
+        def _put() -> None:
             if self._closing:
                 return
             if self._queue.full():
@@ -211,6 +348,37 @@ class SystemAudioTrack(AudioStreamTrack):
             # event loop already closed
             pass
 
+    # ------------------------------------------------------------------ callbacks
+    def _on_sounddevice_audio(self, indata, frames, time_info, status):  # pragma: no cover - realtime callback
+        if status:
+            logger.debug("Rendszerhang stream státusz (sounddevice): %s", status)
+        if self._closing:
+            return
+        data = np.array(indata, dtype=np.float32)
+        if data.ndim == 1:
+            data = np.expand_dims(data, axis=1)
+        if self._discord_meter.is_active():
+            data = np.zeros_like(data)
+        self._submit_audio_block(data.T)
+
+    def _on_pyaudio_audio(self, in_data, frame_count, time_info, status_flags):  # pragma: no cover - realtime callback
+        status_value = pyaudio.paContinue if pyaudio is not None else 0
+        if status_flags:
+            logger.debug("Rendszerhang stream státusz (PyAudio): %s", status_flags)
+        if self._closing or pyaudio is None:
+            return (None, status_value)
+        data = np.frombuffer(in_data, dtype=np.float32)
+        if not data.size:
+            return (None, status_value)
+        try:
+            data = data.reshape(-1, _CHANNELS)
+        except ValueError:
+            data = data[: frame_count * _CHANNELS].reshape(-1, _CHANNELS)
+        if self._discord_meter.is_active():
+            data = np.zeros_like(data)
+        self._submit_audio_block(data.T)
+        return (None, status_value)
+
     async def recv(self) -> av.AudioFrame:
         data = await self._queue.get()
         frame = av.AudioFrame.from_ndarray(data, format="flt", layout="stereo")
@@ -223,15 +391,33 @@ class SystemAudioTrack(AudioStreamTrack):
     async def stop(self) -> None:
         self._closing = True
         with self._stream_lock:
-            stream = self._stream
-            self._stream = None
-        if stream:
+            sd_stream = self._sd_stream
+            self._sd_stream = None
+            pa_stream = self._pa_stream
+            self._pa_stream = None
+            pa_instance = self._pa
+            self._pa = None
+        if sd_stream is not None:
             try:
-                stream.stop()
+                sd_stream.stop()
             except Exception:
                 pass
             try:
-                stream.close()
+                sd_stream.close()
+            except Exception:
+                pass
+        if pa_stream is not None and pyaudio is not None:
+            try:
+                pa_stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                pa_stream.close()
+            except Exception:
+                pass
+        if pa_instance is not None:
+            try:
+                pa_instance.terminate()
             except Exception:
                 pass
         await super().stop()
