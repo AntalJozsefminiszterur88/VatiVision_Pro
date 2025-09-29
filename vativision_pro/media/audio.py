@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 _SAMPLE_RATE = 48_000
-_CHANNELS = 2
+_CHANNELS = 1
 _BLOCK_DURATION = 0.02  # 20 ms
 
 
