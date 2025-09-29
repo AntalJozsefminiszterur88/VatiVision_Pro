@@ -258,6 +258,8 @@ class SystemAudioTrack(AudioStreamTrack):
         self._queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=8)
         self._pts = 0
         self._block_frames = int(_SAMPLE_RATE * block_duration)
+        self._sample_rate = _SAMPLE_RATE
+        self._input_channels = _CHANNELS
         self._discord_meter = _DiscordMeter()
         self._closing = False
         self._stream_lock = threading.Lock()
@@ -297,110 +299,94 @@ class SystemAudioTrack(AudioStreamTrack):
             wasapi_settings = sd.WasapiSettings(loopback=True)
         except Exception:
             wasapi_settings = None
-        def _query_device(kind: Optional[str] = None) -> dict[str, float | int]:
-            try:
-                info = sd.query_devices(device, kind) if kind else sd.query_devices(device)
-            except Exception:
-                return {}
-            if isinstance(info, dict):
-                return info
-            # sounddevice can also return an object with attributes
-            extracted: dict[str, float | int] = {}
-            for key in ("max_input_channels", "max_output_channels", "default_samplerate"):
-                value = getattr(info, key, None)
-                if value is not None:
-                    extracted[key] = value
-            return extracted
 
-        info_default = _query_device()
-        info_input = _query_device("input")
-        info_output = _query_device("output")
+        try:
+            default_output = sd.default.device[1]
+        except Exception:
+            default_output = None
 
-        logger.debug(
-            "SoundDevice loopback eszközinformáció: default=%s input=%s output=%s",
-            info_default,
-            info_input,
-            info_output,
-        )
+        if isinstance(default_output, (list, tuple)):
+            default_output = default_output[0] if default_output else None
 
-        possible_channels: list[int] = []
-        for info in (info_default, info_input, info_output):
-            for key in ("max_input_channels", "max_output_channels"):
-                value = info.get(key)
-                if value:
-                    possible_channels.append(int(value))
-        possible_channels.extend([_CHANNELS, 2, 1])
+        device_index: Optional[int | str] = None
+        if isinstance(default_output, (int, float, str)):
+            device_index = default_output
+        if device_index is None:
+            device_index = device
 
-        possible_samplerates: list[int] = []
-        for info in (info_default, info_input, info_output):
-            samplerate = info.get("default_samplerate")
-            if samplerate:
-                try:
-                    possible_samplerates.append(int(round(float(samplerate))))
-                except Exception:
-                    continue
-        possible_samplerates.extend([_SAMPLE_RATE, 48_000, 44_100])
+        if isinstance(device_index, float):
+            device_index = int(device_index)
+        if isinstance(device_index, str):
+            device_index = device_index.strip()
 
+        preferred_samplerates = [48_000, 44_100, 96_000, 32_000]
+        preferred_channels = [2, 1]
+
+        selected_samplerate: Optional[int] = None
+        selected_channels: Optional[int] = None
         attempt_errors: list[str] = []
-        last_error: Optional[Exception] = None
 
-        def _unique(values: list[int]) -> list[int]:
-            seen: set[int] = set()
-            ordered: list[int] = []
-            for value in values:
-                if not value:
-                    continue
-                if value in seen:
-                    continue
-                seen.add(value)
-                ordered.append(value)
-            return ordered
-
-        channels_to_try = _unique(possible_channels)
-        samplerates_to_try = _unique(possible_samplerates)
-
-        for channels in channels_to_try:
-            for samplerate in samplerates_to_try:
+        for samplerate in preferred_samplerates:
+            for channels in preferred_channels:
                 try:
-                    logger.debug(
-                        "SoundDevice loopback próbálkozás: device=%s channels=%s samplerate=%s",
-                        device,
-                        channels,
-                        samplerate,
-                    )
-                    stream = sd.InputStream(
-                        samplerate=samplerate,
+                    sd.check_input_settings(
+                        device=device_index,
                         channels=channels,
-                        blocksize=self._block_frames,
-                        dtype="float32",
-                        device=device,
-                        callback=self._on_sounddevice_audio,
+                        samplerate=samplerate,
                         extra_settings=wasapi_settings,
                     )
-                    stream.start()
-                except Exception as exc:  # pragma: no cover - runtime guard
-                    last_error = exc
+                except Exception as exc:
                     attempt_errors.append(
-                        f"channels={channels}, samplerate={samplerate}: {exc}"
+                        f"samplerate={samplerate}, channels={channels}: {exc}"
                     )
                     continue
-                self._sd_stream = stream
-                logger.debug(
-                    "SoundDevice loopback sikeresen elindítva: device=%s channels=%s samplerate=%s",
-                    device,
-                    channels,
-                    samplerate,
-                )
-                return
+                selected_samplerate = samplerate
+                selected_channels = channels
+                break
+            if selected_samplerate is not None:
+                break
 
-        if last_error is not None:
-            logger.error(
-                "Nem sikerült elindítani a rendszerhang rögzítését. Próbálkozások: %s",
-                "; ".join(attempt_errors),
+        if selected_samplerate is None or selected_channels is None:
+            detail = "; ".join(attempt_errors)
+            if detail:
+                detail = f" Próbálkozások: {detail}"
+            raise RuntimeError(
+                "Failed to find a supported loopback audio configuration for the default device." + detail
             )
-            raise last_error
 
-        raise RuntimeError("Nem sikerült elindítani a rendszerhang rögzítését.")
+        blocksize = max(1, int(round(selected_samplerate * _BLOCK_DURATION)))
+
+        try:
+            stream = sd.InputStream(
+                samplerate=selected_samplerate,
+                channels=selected_channels,
+                blocksize=blocksize,
+                dtype="float32",
+                device=device_index,
+                callback=self._on_sounddevice_audio,
+                extra_settings=wasapi_settings,
+            )
+            stream.start()
+        except Exception:  # pragma: no cover - runtime guard
+            logger.error(
+                "Nem sikerült elindítani a rendszerhang rögzítését: samplerate=%s channels=%s device=%s",  # noqa: E501
+                selected_samplerate,
+                selected_channels,
+                device_index,
+                exc_info=True,
+            )
+            raise
+
+        self._sd_stream = stream
+        self._sample_rate = selected_samplerate
+        self._input_channels = selected_channels
+        self._block_frames = blocksize
+        logger.debug(
+            "SoundDevice loopback sikeresen elindítva: device=%s channels=%s samplerate=%s",
+            device_index,
+            selected_channels,
+            selected_samplerate,
+        )
 
     def _start_pyaudio_stream(self) -> None:
         if pyaudio is None:
@@ -493,9 +479,9 @@ class SystemAudioTrack(AudioStreamTrack):
     async def recv(self) -> av.AudioFrame:
         data = await self._queue.get()
         frame = av.AudioFrame.from_ndarray(data, format="flt", layout="stereo")
-        frame.sample_rate = _SAMPLE_RATE
+        frame.sample_rate = self._sample_rate
         frame.pts = self._pts
-        frame.time_base = Fraction(1, _SAMPLE_RATE)
+        frame.time_base = Fraction(1, self._sample_rate)
         self._pts += data.shape[1]
         return frame
 
