@@ -28,6 +28,13 @@ class ScriptNotFoundError(FileNotFoundError):
     """Raised when the target script cannot be located."""
 
 
+def _format_add_data(source: Path, destination: str) -> str:
+    """Return a platform correct ``--add-data`` specification."""
+
+    separator = ";" if sys.platform.startswith("win") else ":"
+    return f"{source}{separator}{destination}"
+
+
 def _build_arguments(script: Path, *, icon: Path | None, name: str | None) -> List[str]:
     """Compose the argument list that will be passed to PyInstaller."""
 
@@ -38,6 +45,10 @@ def _build_arguments(script: Path, *, icon: Path | None, name: str | None) -> Li
 
     if name:
         args.extend(["--name", name])
+
+    logo_path = DEFAULT_ICON
+    if logo_path.exists():
+        args.extend(["--add-data", _format_add_data(logo_path, ".")])
 
     args.append(str(script))
     return args
