@@ -17,6 +17,7 @@ from typing import Iterable, List
 REPO_ROOT = Path(__file__).parent.resolve()
 DEFAULT_SCRIPT = REPO_ROOT / "main.py"
 DEFAULT_ICON = REPO_ROOT / "program_logo.png"
+DEFAULT_NAME = "VatiVisionPro"
 
 
 class PyInstallerNotFoundError(RuntimeError):
@@ -30,7 +31,7 @@ class ScriptNotFoundError(FileNotFoundError):
 def _build_arguments(script: Path, *, icon: Path | None, name: str | None) -> List[str]:
     """Compose the argument list that will be passed to PyInstaller."""
 
-    args = ["--noconfirm", "--onefile", "--clean"]
+    args = ["--noconfirm", "--onefile", "--clean", "--windowed"]
 
     if icon and icon.exists():
         args.extend(["--icon", str(icon)])
@@ -85,8 +86,11 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--name",
         type=str,
-        default=None,
-        help="Name of the generated executable (defaults to the script name)",
+        default=DEFAULT_NAME,
+        help=(
+            "Name of the generated executable (defaults to VatiVisionPro.exe "
+            "when not specified)"
+        ),
     )
     parser.add_argument(
         "--icon",
