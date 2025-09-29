@@ -1548,8 +1548,6 @@ class Main(QtWidgets.QMainWindow):
         else:
             self.log_ui_message("A rendszer nem támogatja a tálca ikont, kilépéskor az alkalmazás bezárul.", logging.INFO)
 
-        self._restore_settings()
-        self._update_role_ui(self.role_combo.currentData() or "sender")
         self.fullscreen_window: Optional[FullscreenViewer] = None
         self._last_pixmap: Optional[QtGui.QPixmap] = None
         if CURSOR_IMAGE_PATH.exists():
@@ -1565,6 +1563,9 @@ class Main(QtWidgets.QMainWindow):
         self._pointer_local = False
         self._screen_pointer_overlay = ScreenPointerOverlay()
         self._screen_pointer_overlay.set_cursor_source(self._cursor_pixmap)
+
+        self._restore_settings()
+        self._update_role_ui(self.role_combo.currentData() or "sender")
 
     @QtCore.Slot(str)
     def append_log_message(self, message: str) -> None:
