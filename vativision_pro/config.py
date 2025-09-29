@@ -35,6 +35,7 @@ def _iter_project_roots() -> list[Path]:
 
 PROJECT_ROOT = _iter_project_roots()[0]
 MEDIA_DIR = PROJECT_ROOT / "vativision_pro" / "media"
+BONECA_AMBALABU_AUDIO = MEDIA_DIR / "boneca ambalabu.mp3"
 
 SIGNALING_WS = "wss://vatib-vezerlo.duckdns.org/ws"
 TURN_HOST = "vatib-vezerlo.duckdns.org"
@@ -86,6 +87,7 @@ __all__ = [
     "APP_TITLE",
     "APP_ICON_PATH",
     "CURSOR_IMAGE_PATH",
+    "BONECA_AMBALABU_AUDIO",
     "BW_SECONDS",
     "BW_CHUNK",
     "BW_MAX_BUF",
