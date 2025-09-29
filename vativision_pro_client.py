@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import ctypes
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from time import perf_counter
 from typing import Optional, Tuple
@@ -27,6 +28,12 @@ from vati_screenshare import (
     RESOLUTIONS,
     CURSOR_SCALE_RATIO,
     CURSOR_MIN_SIZE,
+)
+from vati_audio import (
+    SystemAudioTrack,
+    AudioPlayback,
+    audio_capture_supported,
+    audio_playback_supported,
 )
 
 def _resolve_documents_dir() -> Path:
@@ -131,6 +138,16 @@ BW_CHUNK     = 16 * 1024
 BW_MAX_BUF   = 4 * 1024 * 1024
 
 DARK_BG = "#2b2d31"; DARK_CARD = "#313338"; DARK_ELEV = "#1e1f22"; ACCENT = "#5865f2"; TEXT="#e3e5e8"
+
+
+@dataclass
+class ShareParams:
+    width: int
+    height: int
+    fps: int
+    bitrate_kbps: int
+    share_audio: bool
+
 def style():
     return f"""
     QWidget {{ background-color:{DARK_BG}; color:{TEXT}; font-family:Segoe UI, Inter, Roboto, Arial; font-size:14px; }}
@@ -510,8 +527,12 @@ class Core(QtCore.QObject):
 
         self._share_track: Optional[ScreenShareTrack] = None
         self._video_sender = None
+        self._audio_track: Optional[SystemAudioTrack] = None
+        self._audio_sender = None
         self._target_bitrate_bps: Optional[int] = None
-        self._share_resume_params: Optional[Tuple[int, int, int, int]] = None
+        self._share_resume_params: Optional[ShareParams] = None
+        self._audio_sink: Optional[AudioPlayback] = None
+        self._audio_volume: float = 1.0
 
         self._pending_answer: Optional[asyncio.Future] = None
         self._offer_lock = asyncio.Lock()
@@ -566,6 +587,8 @@ class Core(QtCore.QObject):
         def _on_track(track):
             if track.kind == "video":
                 asyncio.create_task(self._consume_video(track))
+            elif track.kind == "audio":
+                asyncio.create_task(self._consume_audio(track))
 
         if self.role == "sender":
             self.channel = self.pc.createDataChannel("chat")
@@ -603,6 +626,48 @@ class Core(QtCore.QObject):
                 self.video_frame.emit(qimg)
         except Exception as e:
             self._emit_log(f"[media] video consumer ended: {e}", logging.ERROR)
+
+    async def _consume_audio(self, track):
+        sink = self._ensure_audio_sink()
+        if sink is None:
+            self._emit_log(
+                "[media] Audio track érkezett, de a lejátszás nem támogatott ezen a rendszeren.",
+                logging.INFO,
+            )
+            try:
+                while True:
+                    await track.recv()
+            except Exception:
+                return
+        else:
+            try:
+                while True:
+                    frame = await track.recv()
+                    data = frame.to_ndarray(format="flt")
+                    sink.submit(data)
+            except Exception as e:
+                self._emit_log(f"[media] audio consumer ended: {e}", logging.ERROR)
+
+    def _ensure_audio_sink(self) -> Optional[AudioPlayback]:
+        if not audio_playback_supported():
+            return None
+        if self._audio_sink is None:
+            try:
+                self._audio_sink = AudioPlayback(volume=self._audio_volume)
+            except Exception as exc:
+                self._emit_log(
+                    f"[media] Nem sikerült elindítani a hanglejátszást: {exc}",
+                    logging.ERROR,
+                )
+                self._audio_sink = None
+        elif self._audio_sink:
+            self._audio_sink.set_volume(self._audio_volume)
+        return self._audio_sink
+
+    def set_audio_volume(self, volume: float) -> None:
+        self._audio_volume = float(max(0.0, min(1.0, volume)))
+        if self._audio_sink:
+            self._audio_sink.set_volume(self._audio_volume)
 
     def _handle_message(self, m):
         if isinstance(m, str):
@@ -855,11 +920,17 @@ class Core(QtCore.QObject):
             await self._establish_connection()
             self._emit_log("Kapcsolat helyreállt.")
             self.status.emit("Kapcsolat helyreállt ✅")
-            if self._share_resume_params:
-                width, height, fps, kbps = self._share_resume_params
+            params = self._share_resume_params
+            if params:
                 self._emit_log("[media] Képernyőmegosztás automatikus újraindítása.")
                 try:
-                    await self.start_share(width, height, fps, kbps)
+                    await self.start_share(
+                        params.width,
+                        params.height,
+                        params.fps,
+                        params.bitrate_kbps,
+                        params.share_audio,
+                    )
                 except Exception as e:
                     self._emit_log(
                         f"[media] Automatikus képernyőmegosztás indítása sikertelen: {e}",
@@ -975,7 +1046,14 @@ class Core(QtCore.QObject):
         except Exception as exc:
             self._emit_log(f"Kurzor elrejtési üzenet küldési hiba: {exc}", logging.DEBUG)
 
-    async def start_share(self, width: int, height: int, fps: int, bitrate_kbps: int):
+    async def start_share(
+        self,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate_kbps: int,
+        share_audio: bool,
+    ):
         if not self.pc:
             self._emit_log("Nincs aktív PeerConnection.", logging.WARNING)
             return
@@ -985,6 +1063,31 @@ class Core(QtCore.QObject):
 
         self._share_track = ScreenShareTrack(width=width, height=height, fps=fps)
         self._video_sender = self.pc.addTrack(self._share_track)
+
+        audio_enabled = False
+        if share_audio:
+            if not audio_capture_supported():
+                self._emit_log(
+                    "[media] A rendszerhang megosztása nem támogatott ezen az eszközön.",
+                    logging.WARNING,
+                )
+            else:
+                try:
+                    self._audio_track = SystemAudioTrack()
+                    self._audio_sender = self.pc.addTrack(self._audio_track)
+                    self._emit_log("[media] Hangmegosztás engedélyezve.")
+                    audio_enabled = True
+                except Exception as exc:
+                    self._emit_log(
+                        f"[media] Hangmegosztás indítása sikertelen: {exc}",
+                        logging.ERROR,
+                    )
+                    self._audio_track = None
+                    self._audio_sender = None
+        else:
+            await self._stop_audio_sender()
+
+        audio_enabled = audio_enabled or bool(self._audio_track)
 
         self._target_bitrate_bps = max(50_000, int(bitrate_kbps) * 1000)
         try:
@@ -1005,7 +1108,7 @@ class Core(QtCore.QObject):
         except Exception as e:
             self._emit_log(f"[media] setParameters hiba (indítás): {e}", logging.ERROR)
 
-        params_snapshot = (width, height, fps, bitrate_kbps)
+        params_snapshot = ShareParams(width, height, fps, bitrate_kbps, audio_enabled)
         await self._create_and_send_offer()
         self._share_resume_params = params_snapshot
         self._emit_log("[media] Képernyőmegosztás elindítva.")
@@ -1024,6 +1127,7 @@ class Core(QtCore.QObject):
             except Exception:
                 pass
             self._share_track = None
+        await self._stop_audio_sender()
         if renegotiate and self.pc:
             try:
                 await self._create_and_send_offer()
@@ -1034,13 +1138,34 @@ class Core(QtCore.QObject):
         self._emit_log("[media] Képernyőmegosztás leállítva.")
         self._cancel_pointer_hide()
 
+    async def _stop_audio_sender(self) -> None:
+        if self._audio_sender:
+            if self.pc:
+                try:
+                    self.pc.removeTrack(self._audio_sender)
+                except Exception:
+                    pass
+            self._audio_sender = None
+        if self._audio_track:
+            try:
+                await self._audio_track.stop()
+            except Exception:
+                pass
+            self._audio_track = None
+
     async def set_resolution(self, width: int, height: int):
         if self._share_track:
             self._share_track.set_size(width, height)
             self._emit_log(f"[media] Új felbontás: {width}×{height}")
         if self._share_resume_params:
-            _, _, fps, kbps = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            params = self._share_resume_params
+            self._share_resume_params = ShareParams(
+                width,
+                height,
+                params.fps,
+                params.bitrate_kbps,
+                params.share_audio,
+            )
 
     async def set_fps(self, fps: int):
         if self._share_track:
@@ -1061,8 +1186,14 @@ class Core(QtCore.QObject):
                 self._emit_log(f"[media] setParameters (fps) hiba: {e}", logging.ERROR)
         self._emit_log(f"[media] Új FPS: {fps}")
         if self._share_resume_params:
-            width, height, _, kbps = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            params = self._share_resume_params
+            self._share_resume_params = ShareParams(
+                params.width,
+                params.height,
+                fps,
+                params.bitrate_kbps,
+                params.share_audio,
+            )
 
     async def set_bitrate(self, kbps: int):
         self._target_bitrate_bps = max(50_000, int(kbps) * 1000)
@@ -1081,8 +1212,14 @@ class Core(QtCore.QObject):
             except Exception as e:
                 self._emit_log(f"[media] setParameters (bitrate) hiba: {e}", logging.ERROR)
         if self._share_resume_params:
-            width, height, fps, _ = self._share_resume_params
-            self._share_resume_params = (width, height, fps, kbps)
+            params = self._share_resume_params
+            self._share_resume_params = ShareParams(
+                params.width,
+                params.height,
+                params.fps,
+                kbps,
+                params.share_audio,
+            )
 
     async def stop(self):
         self._stopping = True
@@ -1094,6 +1231,12 @@ class Core(QtCore.QObject):
                 pass
         await self._cleanup_connection(for_reconnect=False)
         self.status.emit("Leállítva")
+        if self._audio_sink:
+            try:
+                self._audio_sink.close()
+            except Exception:
+                pass
+            self._audio_sink = None
 
     def _cancel_ice_retry(self) -> None:
         task = self._ice_retry_task
@@ -1292,6 +1435,13 @@ class Main(QtWidgets.QMainWindow):
         self.br_slider.setRange(100, 50000); self.br_slider.setSingleStep(50); self.br_slider.setValue(4000)
         self.br_label = QtWidgets.QLabel("Bitráta: 4000 kbps")
 
+        self.chk_share_audio = QtWidgets.QCheckBox("Hang megosztása")
+        if not audio_capture_supported():
+            self.chk_share_audio.setEnabled(False)
+            self.chk_share_audio.setToolTip(
+                "A rendszerhang megosztása ezen az eszközön nem támogatott."
+            )
+
         self.btn_share_start = AnimatedButton("Megosztás indítása")
         self.btn_share_stop  = AnimatedButton("Megosztás leállítása")
 
@@ -1312,8 +1462,9 @@ class Main(QtWidgets.QMainWindow):
         sh.addWidget(self.fps_slider, 1, 1, 1, 2)
         sh.addWidget(self.br_label, 2, 0)
         sh.addWidget(self.br_slider, 2, 1, 1, 2)
-        sh.addWidget(self.btn_share_start, 3, 1)
-        sh.addWidget(self.btn_share_stop, 3, 2)
+        sh.addWidget(self.chk_share_audio, 3, 0, 1, 3)
+        sh.addWidget(self.btn_share_start, 4, 1)
+        sh.addWidget(self.btn_share_stop, 4, 2)
         v.addWidget(share)
 
         preview_box = QtWidgets.QGroupBox("Bejövő videó (fogadó)")
@@ -1337,6 +1488,18 @@ class Main(QtWidgets.QMainWindow):
         self.pointer_overlay.hide()
 
         controls_row = QtWidgets.QHBoxLayout()
+        self.audio_volume_label = QtWidgets.QLabel("Hang: 80%")
+        self.audio_volume_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.audio_volume_slider.setRange(0, 100)
+        self.audio_volume_slider.setValue(80)
+        self.audio_volume_slider.setSingleStep(5)
+        if not audio_playback_supported():
+            self.audio_volume_slider.setEnabled(False)
+            tip = "A hang lejátszása ezen a rendszeren nem támogatott."
+            self.audio_volume_slider.setToolTip(tip)
+            self.audio_volume_label.setToolTip(tip)
+        controls_row.addWidget(self.audio_volume_label)
+        controls_row.addWidget(self.audio_volume_slider, 2)
         controls_row.addStretch(1)
         self.btn_fullscreen = AnimatedButton("Teljes képernyő")
         controls_row.addWidget(self.btn_fullscreen)
@@ -1363,6 +1526,10 @@ class Main(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.on_res_changed)
         self.fps_slider.valueChanged.connect(self.on_fps_changed)
         self.br_slider.valueChanged.connect(self.on_br_changed)
+        self.chk_share_audio.toggled.connect(
+            lambda checked: self._save_setting("ui/share_audio", checked)
+        )
+        self.audio_volume_slider.valueChanged.connect(self.on_audio_volume_changed)
 
         self.role_combo.currentIndexChanged.connect(self.on_role_changed)
         self.chk_relay.toggled.connect(
@@ -1438,6 +1605,7 @@ class Main(QtWidgets.QMainWindow):
         self.core.msg_in.connect(self.inbox.appendPlainText)
         self.core.video_frame.connect(self.update_video)
         self.core.pointer.connect(self.on_pointer_update)
+        self.core.set_audio_volume(self.audio_volume_slider.value() / 100.0)
 
         async def _run():
             try: await self.core.start()
@@ -1473,10 +1641,12 @@ class Main(QtWidgets.QMainWindow):
         label = self.res_combo.currentText()
         width, height = RESOLUTIONS[label]
         fps = self.fps_slider.value(); kbps = self.br_slider.value()
+        share_audio = self.chk_share_audio.isChecked()
         self.log_ui_message(
             f"Képernyőmegosztás indítása: {label}, {fps} FPS, {kbps} kbps"
+            + (" + hang" if share_audio else "")
         )
-        asyncio.create_task(self.core.start_share(width, height, fps, kbps))
+        asyncio.create_task(self.core.start_share(width, height, fps, kbps, share_audio))
 
     @QtCore.Slot()
     def on_share_stop(self):
@@ -1513,6 +1683,13 @@ class Main(QtWidgets.QMainWindow):
         self._save_setting("ui/bitrate", val)
         self._pending_bitrate = val
         self._br_debounce.start(200)
+
+    @QtCore.Slot(int)
+    def on_audio_volume_changed(self, value: int):
+        self.audio_volume_label.setText(f"Hang: {value}%")
+        self._save_setting("ui/audio_volume", value)
+        if self.core:
+            self.core.set_audio_volume(value / 100.0)
 
     @QtCore.Slot(QtGui.QImage)
     def update_video(self, img: QtGui.QImage):
@@ -1769,6 +1946,9 @@ class Main(QtWidgets.QMainWindow):
         prefer = self.settings.value("ui/prefer_relay", False)
         self.chk_relay.setChecked(self._to_bool(prefer))
 
+        share_audio = self.settings.value("ui/share_audio", False)
+        self.chk_share_audio.setChecked(self._to_bool(share_audio))
+
         res = self.settings.value("ui/resolution")
         if res:
             r_idx = self.res_combo.findText(str(res))
@@ -1787,12 +1967,22 @@ class Main(QtWidgets.QMainWindow):
         )
         self.br_slider.setValue(bitrate)
 
+        audio_vol = self._to_int(
+            self.settings.value("ui/audio_volume", self.audio_volume_slider.value()),
+            fallback=self.audio_volume_slider.value(),
+        )
+        self.audio_volume_slider.setValue(audio_vol)
+        self.audio_volume_label.setText(f"Hang: {audio_vol}%")
+
     def _save_setting(self, key: str, value) -> None:
         self.settings.setValue(key, value)
 
     def _update_role_ui(self, role_value: str) -> None:
         is_sender = role_value == "sender"
         self.share_group.setVisible(is_sender)
+        show_audio = role_value == "receiver"
+        self.audio_volume_label.setVisible(show_audio)
+        self.audio_volume_slider.setVisible(show_audio)
         if not is_sender:
             self._screen_pointer_overlay.hide_pointer()
 
