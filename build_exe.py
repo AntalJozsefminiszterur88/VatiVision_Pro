@@ -50,6 +50,13 @@ def _build_arguments(script: Path, *, icon: Path | None, name: str | None) -> Li
     if logo_path.exists():
         args.extend(["--add-data", _format_add_data(logo_path, ".")])
 
+    media_dir = REPO_ROOT / "vativision_pro" / "media"
+    if media_dir.exists():
+        args.extend([
+            "--add-data",
+            _format_add_data(media_dir, "vativision_pro/media"),
+        ])
+
     args.append(str(script))
     return args
 
