@@ -23,6 +23,8 @@ RESOLUTIONS = {
 
 CURSOR_SCALE_RATIO = 0.025
 CURSOR_MIN_SIZE = 12
+CURSOR_OFFSET_X = -5
+CURSOR_OFFSET_Y = -5
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +76,32 @@ class ScreenShareTrack(VideoStreamTrack):
             logger.warning("A kurzor ikon (%s) nem található.", cursor_path)
             return
         try:
-            self._cursor_image = Image.open(cursor_path).convert("RGBA")
+            loaded = Image.open(cursor_path).convert("RGBA")
+            self._cursor_image = self._sanitize_cursor_transparency(loaded)
         except Exception as exc:
             logger.exception("Nem sikerült betölteni a kurzor ikont: %s", exc)
             self._cursor_image = None
             return
         self._cursor_cache = None
         self._cursor_cache_size = None
+
+    @staticmethod
+    def _sanitize_cursor_transparency(img: Image.Image) -> Image.Image:
+        """Távolítsa el a kurzor háttérszínét, ha az opák."""
+        if img.mode != "RGBA":
+            return img
+        arr = np.array(img)
+        if arr.ndim != 3 or arr.shape[2] != 4:
+            return img
+        background = arr[0, 0, :3]
+        alpha = arr[0, 0, 3]
+        if alpha == 0:
+            return img
+        mask = np.all(arr[:, :, :3] == background, axis=-1)
+        if not np.any(mask):
+            return img
+        arr[mask, 3] = 0
+        return Image.fromarray(arr, mode="RGBA")
 
     def set_size(self, width: int, height: int):
         self._size = (int(width), int(height))
@@ -203,8 +224,8 @@ class ScreenShareTrack(VideoStreamTrack):
             norm_x, norm_y = self._pointer_norm
         width, height = img.size
         cw, ch = cursor.size
-        x = int(round(norm_x * width))
-        y = int(round(norm_y * height))
+        x = int(round(norm_x * width + CURSOR_OFFSET_X))
+        y = int(round(norm_y * height + CURSOR_OFFSET_Y))
         x = max(0, min(x, max(0, width - cw)))
         y = max(0, min(y, max(0, height - ch)))
         base = img.convert("RGBA")
